@@ -1,0 +1,50 @@
+{
+  "name": "groklink",
+  "version": "0.1.0",
+  "description": "Secure always-on bridge between MCP clients (Claude, Cursor, Codex) and the Grok Bot desktop app. Unofficial.",
+  "keywords": [
+    "grok",
+    "grok-bot",
+    "mcp",
+    "claude",
+    "claude-code",
+    "cursor",
+    "codex",
+    "agents",
+    "cdp"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/safwaankira/groklink.git"
+  },
+  "homepage": "https://github.com/safwaankira/groklink#readme",
+  "bugs": {
+    "url": "https://github.com/safwaankira/groklink/issues"
+  },
+  "type": "module",
+  "bin": {
+    "groklink": "dist/groklink.js",
+    "groklinkd": "dist/groklinkd.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "SECURITY.md",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "bun build src/client/cli.ts --target=node --outfile=dist/groklink.js && bun build src/daemon/main.ts --target=node --outfile=dist/groklinkd.js && chmod +x dist/*.js",
+    "check": "tsc --noEmit && biome check ."
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.15",
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
+  }
+}
