@@ -3,7 +3,7 @@
 import { randomBytes } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
-import { findBot, type Message, read, send, type WaitResult, wait } from "../base/bot.ts";
+import { findBot, type Message, read, send, type Usage, usage, type WaitResult, wait } from "../base/bot.ts";
 import type { CDP } from "../base/cdp.ts";
 import { BOX_PHASE } from "../base/page.ts";
 import { enforce, ensurePolicy, PolicyError } from "../shared/policy.ts";
@@ -53,6 +53,8 @@ export type BotLayer = {
   recent?(botId: string, limit: number): Promise<Message[]>;
   /** The Bot computer's phase ("settled", "away", "asleep", ...), or null. Without it, no sleep warnings. */
   phase?(): Promise<string | null>;
+  /** The weekly usage limit. Without it, tasks are never refused for usage. */
+  usage?(): Promise<Usage>;
 };
 
 export function baseLayer(link: { requireCdp(): CDP }): BotLayer {
@@ -63,6 +65,7 @@ export function baseLayer(link: { requireCdp(): CDP }): BotLayer {
     read: async (botId, since) => (await read(link.requireCdp(), botId, { since })).messages,
     recent: async (botId, limit) => (await read(link.requireCdp(), botId, { limit })).messages,
     phase: () => link.requireCdp().eval<string | null>(BOX_PHASE),
+    usage: () => usage(link.requireCdp()),
   };
 }
 
@@ -82,6 +85,9 @@ export type JobsOptions = {
   pollMs?: number;
   /** How often a working job checks whether the Bot's computer fell asleep. */
   phaseEveryMs?: number;
+  /** How often a working job checks whether Grok usage ran out, and how long a usage reading is reused. */
+  usageEveryMs?: number;
+  usageCacheMs?: number;
   /** Milliseconds since the epoch; tests pass a fake clock. */
   clock?: () => number;
 };
@@ -94,6 +100,21 @@ const MAX_REPAIRS = 2;
 const RECENT = 20;
 const EVENT_OF: Record<string, EventType> = { done: "done", needs_input: "needs_input", failed: "failed", stale: "idle" };
 const ASLEEP = ["away", "asleep"];
+/**
+ * Out of usage: the weekly allowance is spent and on-demand usage can't cover it (off, or at its limit).
+ * The app's own `hasAvailableUsage` flag isn't used: it was seen `true` at 100% with on-demand off.
+ */
+export function usageOut(u: Usage): boolean {
+  if (u.percentUsed < 100) return false;
+  const od = u.onDemand;
+  return !od?.enabled || (od.limitCents != null && od.usedCents >= od.limitCents);
+}
+
+const usageMessage = (u: Usage, tail: string) =>
+  `Grok Bot weekly usage is used up (${Math.floor(u.percentUsed)}%). It resets at ${u.resetsAt ?? "an unknown time"}. Enable on-demand usage in Grok Bot to continue sooner. ${tail}`;
+
+export type UsageSummary = { percentUsed: number; resetsAt: string | null; out: boolean };
+
 export const SLEEP_WARNING =
   "Bot's computer is asleep: the Grok Bot window has been in the background for 10+ minutes. Bring it to the front to wake it.";
 
@@ -149,6 +170,7 @@ export class Jobs {
   private timers: NodeJS.Timeout[] = [];
   /** Per-job sleep-warning polls, cleared when the job's waiter ends or the daemon closes. */
   private watches = new Set<NodeJS.Timeout>();
+  private usageCache: { at: number; value: Usage } | null = null;
   private closed = false;
 
   constructor(opts: JobsOptions) {
@@ -160,6 +182,8 @@ export class Jobs {
       retryMs: 5_000,
       pollMs: 1_000,
       phaseEveryMs: 30_000,
+      usageEveryMs: 60_000,
+      usageCacheMs: 60_000,
       clock: Date.now,
       policyFile: join(dirname(opts.dir), "policy.json"),
       ...opts,
@@ -174,12 +198,19 @@ export class Jobs {
     let wasConnected = false;
     const poll = () => {
       const connected = this.o.link.connected;
-      if (connected && !wasConnected) void this.reload();
+      if (connected && !wasConnected) {
+        void this.reload();
+        void this.readUsage();
+      }
       wasConnected = connected;
     };
     this.timers.push(
       setInterval(() => this.cleanup(), this.o.cleanupEveryMs),
       setInterval(poll, this.o.pollMs),
+      // Keeps the usage shown by `health` at most a minute old.
+      setInterval(() => {
+        if (this.o.link.connected) void this.readUsage();
+      }, this.o.usageEveryMs),
     );
     poll();
   }
@@ -196,6 +227,8 @@ export class Jobs {
     if (schema !== null && (typeof schema !== "object" || Array.isArray(schema)))
       throw new ProtocolError("bad_request", '"schema" must be a JSON Schema object.');
     enforce(wrapBrief(brief, schema), this.o.policyFile);
+    const u = await this.readUsage();
+    if (u && usageOut(u)) throw new ProtocolError("usage_exhausted", usageMessage(u, "Nothing was sent."));
     const files = params.files ?? [];
     const relative = files.find((f) => !isAbsolute(f));
     if (relative !== undefined) throw new ProtocolError("bad_request", `File paths must be absolute: ${relative}`);
@@ -374,13 +407,59 @@ export class Jobs {
     if (this.waiting.has(job.jobId)) return;
     this.waiting.add(job.jobId);
     const watch = this.watchPhase(job);
+    const usageWatch = this.watchUsage(job);
     void this.waitLoop(job).finally(() => {
-      clearInterval(watch);
-      this.watches.delete(watch);
+      for (const t of [watch, usageWatch]) {
+        clearInterval(t);
+        this.watches.delete(t);
+      }
       this.waiting.delete(job.jobId);
       if (job.status !== "working" && job.status !== "queued") this.active.delete(job.jobId);
       void this.next(job.botId);
     });
+  }
+
+  /** The usage summary for `health`: null if it can't be read. */
+  async usageSummary(): Promise<UsageSummary | null> {
+    await this.readUsage();
+    return this.usageSnapshot();
+  }
+
+  /** The last usage reading, without waiting (refreshed in the background while connected); null if none yet. */
+  usageSnapshot(): UsageSummary | null {
+    const u = this.usageCache?.value;
+    return u ? { percentUsed: u.percentUsed, resetsAt: u.resetsAt, out: usageOut(u) } : null;
+  }
+
+  /** Current usage, reused for `usageCacheMs`; null (logged, never thrown) if it can't be read. */
+  private async readUsage(): Promise<Usage | null> {
+    if (!this.o.layer.usage) return null;
+    const now = this.o.clock();
+    if (this.usageCache && now - this.usageCache.at < this.o.usageCacheMs) return this.usageCache.value;
+    try {
+      const value = await this.o.layer.usage();
+      this.usageCache = { at: now, value };
+      return value;
+    } catch {
+      this.o.log("couldn't read Grok usage; not blocking");
+      return null;
+    }
+  }
+
+  /** Fail a working job if usage ran out. Returns true if it did. */
+  private async failIfOut(job: Job): Promise<boolean> {
+    if (job.status !== "working") return false;
+    const u = await this.readUsage();
+    if (!u || !usageOut(u) || job.status !== "working") return false;
+    this.o.log(`job ${job.jobId} stopped: Grok usage ran out`);
+    this.finish(job, "failed", { code: "usage_exhausted", message: usageMessage(u, "The Bot stopped because Grok usage ran out.") });
+    return true;
+  }
+
+  private watchUsage(job: Job): NodeJS.Timeout {
+    const timer = setInterval(() => void this.failIfOut(job), this.o.usageEveryMs);
+    this.watches.add(timer);
+    return timer;
   }
 
   /** While the job is working, warn once the Bot's computer falls asleep (the status doesn't change). */
@@ -425,6 +504,7 @@ export class Jobs {
           since: anchor,
           timeoutMs: this.o.waitTimeoutMs,
           onUpdate: (m) => {
+            if (job.status === "failed") return;
             if (m.role !== "user") heard();
             this.add(job, m);
           },
@@ -445,10 +525,13 @@ export class Jobs {
         await sleep(this.o.retryMs);
         continue;
       }
+      // Failed while waiting (usage ran out): keep what arrived before, stop here.
+      if (job.status === "failed") return;
       for (const m of r.messages) this.add(job, m);
       if (r.messages.some((m) => m.role !== "user")) heard();
       // A job is done only once the Bot has replied. Idle with nothing new: keep waiting from the same key.
       if (r.status === "done" && !job.messages.length) {
+        if (await this.failIfOut(job)) return;
         if (this.o.clock() - quietSince >= this.o.staleMs)
           return this.finish(job, "stale", { code: "no_reply", message: "The Bot went idle without replying." });
         await sleep(this.o.retryMs);

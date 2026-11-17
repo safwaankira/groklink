@@ -26,6 +26,7 @@ export const ERROR_CODES = [
   "blocked_by_policy",
   "schema_invalid",
   "no_reply",
+  "usage_exhausted",
   "internal",
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];

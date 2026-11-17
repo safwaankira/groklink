@@ -1,6 +1,6 @@
 {
   "name": "groklink",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Secure always-on bridge between MCP clients (Claude, Cursor, Codex) and the Grok Bot desktop app. Unofficial.",
   "keywords": [
     "grok",

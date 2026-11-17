@@ -25,11 +25,17 @@ const near = (a: string, b: string) => `${word(a)}\\S*(?:\\s\\S+){0,6}?\\s[^\\s\
  * So "please like this tweet" counts but "find posts like this on X" doesn't.
  */
 const COMMAND = `(?:^[^\\w@]*|[.!?;:,\\n][^\\w@]*|${word("please|and|then|also|to|go|you should|can you|could you|i want you to|make sure to")} )`;
+/**
+ * A verb right after one of these describes a refusal or a condition, not a command:
+ * "refuses to post on X", "when asked to reply to @foo". ("when/if asked to" are covered by "asked to".)
+ */
+const NOT_COMMAND = "(?<!(?<![\\w@])(?:asked to|refuses to|refusing to|won['\u2019]t|will not|never|blocks attempts to) )";
 
 const PATTERNS: Record<Rule, RegExp[]> = {
   x_write: [
     new RegExp(
       COMMAND +
+        NOT_COMMAND +
         near(
           "send a dm|post|tweet|publish|reply|quote|repost|retweet|like|follow|dm|message",
           "on x|to x|on twitter|tweet|x account|@\\w+",

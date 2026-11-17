@@ -3,9 +3,10 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, w
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
-import type { Message, WaitResult } from "../src/base/bot.ts";
+import type { Message, Usage, WaitResult } from "../src/base/bot.ts";
 import { EventLog } from "../src/daemon/events.ts";
-import { type BotLayer, type Job, Jobs, type JobsOptions, SLEEP_WARNING } from "../src/daemon/jobs.ts";
+import { type BotLayer, type Job, Jobs, type JobsOptions, SLEEP_WARNING, usageOut } from "../src/daemon/jobs.ts";
+import { daemonMethods } from "../src/daemon/server.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -358,4 +359,121 @@ test("the Bot's computer falling asleep adds one warning event and one warnings 
   assert.equal(warnings[0].text, SLEEP_WARNING);
   assert.deepEqual(file(jobId).warnings, [SLEEP_WARNING]);
   assert.equal(file(jobId).status, "working");
+});
+
+const usageAt = (percentUsed: number, onDemand: Usage["onDemand"] = null): Usage => ({
+  percentUsed,
+  resetsAt: "2026-11-20T00:00:00.000Z",
+  plan: "SuperGrok",
+  // The app reported true at 100% with on-demand off, so it must not be trusted.
+  hasAvailableUsage: true,
+  onDemand,
+});
+
+test("usageOut: 100% with on-demand off or at its limit is out; on-demand with room left, or under 100%, isn't", () => {
+  assert.equal(usageOut(usageAt(100)), true);
+  assert.equal(usageOut(usageAt(100, { enabled: false, usedCents: 0, limitCents: null })), true);
+  assert.equal(usageOut(usageAt(100, { enabled: true, usedCents: 500, limitCents: 500 })), true);
+  assert.equal(usageOut(usageAt(100, { enabled: true, usedCents: 100, limitCents: 500 })), false);
+  assert.equal(usageOut(usageAt(100, { enabled: true, usedCents: 900, limitCents: null })), false);
+  assert.equal(usageOut(usageAt(99.5)), false);
+});
+
+test("usage used up: task is refused with usage_exhausted and nothing is sent", async () => {
+  fake.layer.usage = async () => usageAt(100);
+  const j = jobs();
+  await assert.rejects(j.create({ bot: "Alpha", brief: "Reply with the word pong and nothing else." }), {
+    code: "usage_exhausted",
+    message:
+      "Grok Bot weekly usage is used up (100%). It resets at 2026-11-20T00:00:00.000Z. Enable on-demand usage in Grok Bot to continue sooner. Nothing was sent.",
+  });
+  await sleep(30);
+  assert.deepEqual(fake.sent, []);
+  assert.deepEqual(j.list(), []);
+});
+
+test("on-demand enabled at 100%: the task goes ahead", async () => {
+  fake.layer.usage = async () => usageAt(100, { enabled: true, usedCents: 0, limitCents: 1000 });
+  const j = jobs();
+  await j.create({ bot: "Alpha", brief: "Reply with the word pong and nothing else." });
+  await until(() => fake.sent.length === 1);
+});
+
+test("usage can't be read: the task isn't blocked", async () => {
+  fake.layer.usage = async () => {
+    throw new Error("Couldn't read usage from Grok Bot: 503");
+  };
+  const j = jobs();
+  await j.create({ bot: "Alpha", brief: "Reply with the word pong and nothing else." });
+  await until(() => fake.sent.length === 1);
+  assert.equal(await j.usageSummary(), null);
+});
+
+test("usage runs out mid-job: the job fails with usage_exhausted, keeps its messages, and its waiter stops", async () => {
+  let current = usageAt(40);
+  fake.layer.usage = async () => current;
+  const j = jobs({ usageEveryMs: 10, usageCacheMs: 0 });
+  const { jobId } = await j.create({ bot: "Alpha", brief: "Reply with the word pong and nothing else." });
+  await until(() => fake.waits.length === 1);
+  fake.waits[0].onUpdate(reply("m1", "working on it"));
+  await sleep(30);
+  assert.equal(file(jobId).status, "working");
+  current = usageAt(100);
+  await until(() => file(jobId).status === "failed");
+  const job = file(jobId);
+  assert.equal(job.error?.code, "usage_exhausted");
+  assert.equal(
+    job.error?.message,
+    "Grok Bot weekly usage is used up (100%). It resets at 2026-11-20T00:00:00.000Z. Enable on-demand usage in Grok Bot to continue sooner. The Bot stopped because Grok usage ran out.",
+  );
+  assert.deepEqual(
+    job.messages.map((m) => m.text),
+    ["working on it"],
+  );
+  assert.ok(events.since(0, 50).some((e) => e.type === "failed" && e.jobId === jobId));
+  // A late reply from the stopped wait changes nothing.
+  fake.waits[0].onUpdate(reply("m2", "pong"));
+  fake.waits[0].resolve({ status: "done", messages: [reply("m2", "pong")], elapsedMs: 1 });
+  await sleep(30);
+  assert.equal(file(jobId).status, "failed");
+  assert.equal(file(jobId).messages.length, 1);
+  assert.equal(fake.waits.length, 1);
+});
+
+test("an idle with no reply checks usage at once: out → failed with usage_exhausted", async () => {
+  let current = usageAt(40);
+  fake.layer.usage = async () => current;
+  const j = jobs({ retryMs: 5, usageCacheMs: 0 });
+  const { jobId } = await j.create({ bot: "Alpha", brief: "Reply with the word pong and nothing else." });
+  await until(() => fake.waits.length === 1);
+  current = usageAt(100);
+  fake.waits[0].resolve({ status: "done", messages: [], elapsedMs: 1 });
+  await until(() => file(jobId).status === "failed");
+  assert.equal(file(jobId).error?.code, "usage_exhausted");
+  assert.equal(fake.waits.length, 1);
+});
+
+test("health shows usage: percent, reset time and out (null until it has been read)", async () => {
+  fake.layer.usage = async () => usageAt(100);
+  const link = { connected: false };
+  const j = jobs({ link });
+  const health = () =>
+    (
+      daemonMethods(
+        {
+          mode: "pipe",
+          connected: link.connected,
+          appVersion: "1.1.0",
+          requireCdp: () => {
+            throw new Error("no CDP");
+          },
+        },
+        { jobs: j },
+      ).health({}) as { usage: unknown }
+    ).usage;
+  assert.equal(health(), null);
+  link.connected = true;
+  await until(() => health() !== null);
+  assert.deepEqual(health(), { percentUsed: 100, resetsAt: "2026-11-20T00:00:00.000Z", out: true });
+  assert.deepEqual(await j.usageSummary(), { percentUsed: 100, resetsAt: "2026-11-20T00:00:00.000Z", out: true });
 });

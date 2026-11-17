@@ -10,7 +10,7 @@ import { createBot, deleteBot, updateBot } from "../base/roster.ts";
 import { changeRoutine, listRoutines, type RoutineChange, runRoutine } from "../base/routines.ts";
 import { type HealthResult, ProtocolError, type Response, type TransportMode } from "../shared/protocol.ts";
 import type { EventLog } from "./events.ts";
-import { JOB_STATUSES, type JobStatus, type Jobs } from "./jobs.ts";
+import { JOB_STATUSES, type JobStatus, type Jobs, type UsageSummary } from "./jobs.ts";
 import type { SelfTestResult } from "./selftest.ts";
 import type { Log } from "./state.ts";
 
@@ -83,13 +83,14 @@ export function daemonMethods(
     return v;
   };
   return {
-    health: (): HealthResult & { selftest: SelfTestResult | null } => ({
+    health: (): HealthResult & { selftest: SelfTestResult | null; usage: UsageSummary | null } => ({
       ok: true,
       mode: link.mode,
       connected: link.connected,
       appVersion: link.appVersion,
       uptimeSec: Math.floor((Date.now() - startedAt) / 1000),
       selftest: opts.selftest?.result ?? null,
+      usage: opts.jobs?.usageSnapshot() ?? null,
     }),
     bots: () => listBots(cdp()),
     task: (p) => {

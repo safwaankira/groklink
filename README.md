@@ -151,6 +151,8 @@ If the self-test fails, `groklink_task` refuses to send and names the failed che
 
 **Closing the Grok Bot window or using another Grok Bot bridge.** If you close the Grok Bot window (Cmd+W), the app keeps running without it, and Grok Link reopens it as a Dock click would. If the window doesn't come back, Grok Link restarts the app. Running jobs carry on either way. Don't run Grok Link next to the old [grokbot-bridge](https://github.com/TheSethRose/grokbot-bridge): each one restarts Grok Bot in its own mode, so they keep quitting each other's copy of the app. That's why `groklink install` refuses while grokbot-bridge is registered.
 
+**`usage_exhausted`.** Your weekly Grok Bot usage is used up (100%) and on-demand usage is off or at its limit, so `groklink_task` refuses new tasks and stops running ones; the error says when usage resets. Enable on-demand usage in Grok Bot to continue sooner.
+
 ## Uninstall
 
 ```bash

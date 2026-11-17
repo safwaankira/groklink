@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.1
+
+- `usage_exhausted`: when the weekly Grok Bot usage is used up and on-demand usage can't cover it, `groklink_task` refuses at once (nothing is sent) and running jobs fail instead of waiting 45 minutes for `no_reply`. `groklink_health` shows `usage: { percentUsed, resetsAt, out }`.
+- Policy: `x_write` no longer blocks briefs that only describe a refusal, such as "refuses to post on X" or "when asked to reply to @someone".
+
 ## 0.1.0
 
 - Daemon (`groklinkd`) that owns the Grok Bot app and keeps one connection to it, relaunching the app if it quits.

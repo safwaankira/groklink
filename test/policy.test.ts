@@ -39,6 +39,11 @@ const BLOCKED: [string, Rule][] = [
 ];
 
 const ALLOWED = [
+  "…its safety policy refusing … when asked to post on X",
+  "Write a short note on Grok Link and its safety policy refusing a brief when asked to post on X.",
+  "It refuses to reply to @foo on X.",
+  "It won't post on X, and it blocks attempts to DM @foo on X.",
+  "If asked to like a tweet, it never does.",
   "find posts on X about monad",
   "summarize this tweet: https://x.com/someone/status/123",
   "what are people saying on X about poidh claims",
