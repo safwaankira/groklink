@@ -38,7 +38,8 @@ export async function isRunning(): Promise<boolean> {
       return stdout.includes(PROCESS_NAME);
     }
     const pattern = process.platform === "darwin" ? "Grok Bot.app/Contents/MacOS/Grok Bot" : "grok-bot|Grok Bot";
-    await run("pgrep", ["-f", pattern]);
+    // Only this user's processes: another account's look-alike process mustn't count.
+    await run("pgrep", ["-U", String(process.getuid?.() ?? ""), "-f", pattern]);
     return true;
   } catch {
     return false;
@@ -49,7 +50,7 @@ async function quit(): Promise<void> {
   if (!(await isRunning())) return;
   if (process.platform === "darwin") await run("osascript", ["-e", `tell application "${PROCESS_NAME}" to quit`]).catch(() => {});
   else if (process.platform === "win32") await run("taskkill", ["/IM", `${PROCESS_NAME}.exe`]).catch(() => {});
-  else await run("pkill", ["-TERM", "-f", "grok-bot|Grok Bot"]).catch(() => {});
+  else await run("pkill", ["-TERM", "-U", String(process.getuid?.() ?? ""), "-f", "grok-bot|Grok Bot"]).catch(() => {});
   for (let i = 0; i < 40 && (await isRunning()); i++) await sleep(250);
   if (await isRunning()) throw new Error("Grok Bot didn't quit. Quit it yourself, then rerun.");
 }

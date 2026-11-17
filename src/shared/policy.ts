@@ -18,8 +18,8 @@ const WHAT: Record<Rule, string> = {
 
 /** A whole word or phrase; `@handle` counts as a word. */
 const word = (alt: string) => `(?<![\\w@])(?:${alt})(?![\\w])`;
-/** `a`, then `b` as a later word, at most 6 words after it. */
-const near = (a: string, b: string) => `${word(a)}\\S*(?:\\s\\S+){0,6}?\\s[^\\s\\w@]*${word(b)}`;
+/** `a`, then `b` as a later word, at most `n` words after it. */
+const near = (a: string, b: string, n = 10) => `${word(a)}\\S*(?:\\s\\S+){0,${n}}?\\s[^\\s\\w@]*${word(b)}`;
 /**
  * Where a verb reads as a command: the start of the text or of a clause, or right after a word like "please".
  * So "please like this tweet" counts but "find posts like this on X" doesn't.
@@ -31,18 +31,24 @@ const COMMAND = `(?:^[^\\w@]*|[.!?;:,\\n][^\\w@]*|${word("please|and|then|also|t
  */
 const NOT_COMMAND = "(?<!(?<![\\w@])(?:asked to|refuses to|refusing to|won['\u2019]t|will not|never|blocks attempts to) )";
 
+/** "send me…", "confirm whether…" ask for information, not an action, so those don't count. */
+const TX_VERBS =
+  "(?:sign|send|submit|approve|broadcast|execute|confirm|authorize|accept)(?! (?:me|us|whether|if|that|how|what|why|when)\\b)";
+const TX_TARGETS = "transaction|transactions|tx|txn|permit|signature|swap|transfer|approval|pending|wallet|contract call|bridge";
+
 const PATTERNS: Record<Rule, RegExp[]> = {
   x_write: [
     new RegExp(
       COMMAND +
         NOT_COMMAND +
         near(
-          "send a dm|post|tweet|publish|reply|quote|repost|retweet|like|follow|dm|message",
-          "on x|to x|on twitter|tweet|x account|@\\w+",
+          "send a dm|post|tweet|publish|reply|quote|repost|retweet|like|follow|dm|message|share|send|upload|thread|boost|amplify",
+          "on x|to x|on twitter|tweet|x account|@\\w+|from my account|my account|my timeline|my profile",
         ),
     ),
   ],
-  tx: [new RegExp(near("sign|send|submit|approve|broadcast|execute", "transaction|tx|txn|permit|signature|swap|transfer"))],
+  // A verb and a target within 10 words, in either order.
+  tx: [new RegExp(near(TX_VERBS, TX_TARGETS)), new RegExp(near(TX_TARGETS, TX_VERBS))],
   wallet: [new RegExp(word("connect (?:a |my |the )?wallet")), new RegExp(word("seed phrase|private key|mnemonic"))],
   claim: [new RegExp(near("submit", "claim|poidh"))],
 };

@@ -1,0 +1,37 @@
+33 briefs. Slip past the policy: 26 before normalization, 14 after.
+
+| Rule | Technique | Before (0.1.1) | After (policyText) |
+|---|---|---|---|
+| x_write | plain (control) | blocked (x_write) | blocked (x_write) |
+| x_write | Cyrillic о | PASSES | blocked (x_write) |
+| x_write | Cyrillic е in 'tweet' | PASSES | blocked (x_write) |
+| x_write | Cyrillic Х in target | PASSES | blocked (x_write) |
+| x_write | Greek ο | PASSES | blocked (x_write) |
+| x_write | zero-width space | PASSES | blocked (x_write) |
+| x_write | zero-width joiner | PASSES | blocked (x_write) |
+| x_write | soft hyphen | PASSES | blocked (x_write) |
+| x_write | full-width letters | PASSES | blocked (x_write) |
+| x_write | math bold letters | PASSES | blocked (x_write) |
+| x_write | leetspeak p0st | PASSES | PASSES |
+| x_write | leetspeak tw33t | PASSES | PASSES |
+| x_write | spaced letters | PASSES | PASSES |
+| x_write | dotted letters | PASSES | PASSES |
+| x_write | Hindi | PASSES | PASSES |
+| x_write | Spanish | PASSES | PASSES |
+| x_write | base64 | PASSES | PASSES |
+| x_write | markdown bold | blocked (x_write) | blocked (x_write) |
+| x_write | HTML tags | PASSES | PASSES |
+| x_write | inline code | blocked (x_write) | blocked (x_write) |
+| x_write | synonym 'share' | PASSES | PASSES |
+| x_write | 'x.com' instead of 'X' | blocked (x_write) | blocked (x_write) |
+| x_write | 'the timeline' | PASSES | PASSES |
+| x_write | split across sentences | PASSES | PASSES |
+| tx | plain (control) | blocked (tx) | blocked (tx) |
+| tx | Cyrillic і | PASSES | blocked (tx) |
+| tx | spaced | PASSES | PASSES |
+| tx | synonym 'confirm' | PASSES | PASSES |
+| wallet | plain (control) | blocked (wallet) | blocked (wallet) |
+| wallet | Cyrillic е | PASSES | blocked (wallet) |
+| wallet | 'link' | PASSES | PASSES |
+| claim | plain (control) | blocked (claim) | blocked (claim) |
+| claim | Cyrillic і | PASSES | blocked (claim) |

@@ -48,7 +48,9 @@ export function defaultEnv(): InstallEnv {
     onPath: (name) => (process.env.PATH ?? "").split(delimiter).some((d) => d && existsSync(join(d, name))),
     health: async () => (await call("health")) as Health,
     out: (line) => console.log(line),
-    desktopRunning: () => process.platform === "darwin" && spawnSync("pgrep", ["-a", "-x", "Claude"], { stdio: "ignore" }).status === 0,
+    desktopRunning: () =>
+      process.platform === "darwin" &&
+      spawnSync("pgrep", ["-a", "-U", String(process.getuid?.() ?? ""), "-x", "Claude"], { stdio: "ignore" }).status === 0,
   };
 }
 
@@ -252,8 +254,9 @@ const xml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replac
 export function plist(env: InstallEnv): string {
   const daemon = join(dirname(env.cli), "groklinkd.js");
   const out = join(env.stateHome, "daemon.out");
-  // launchd doesn't see the shell's environment, so pass on a custom state folder or app path.
-  const vars = ["GROKLINK_HOME", "GROKLINK_APP", "GROKLINK_TRANSPORT"].filter((k) => process.env[k]);
+  // launchd doesn't see the shell's environment, so pass on a custom state folder or app path. GROKLINK_TRANSPORT is
+  // never saved: port0 exposes the debug port to every account, so it mustn't stick across logins.
+  const vars = ["GROKLINK_HOME", "GROKLINK_APP"].filter((k) => process.env[k]);
   const envXml = vars.length
     ? `  <key>EnvironmentVariables</key>\n  <dict>\n${vars.map((k) => `    <key>${k}</key>\n    <string>${xml(process.env[k] as string)}</string>\n`).join("")}  </dict>\n`
     : "";
@@ -346,6 +349,10 @@ export async function install(env: InstallEnv, opts: Options = {}): Promise<numb
     for (const s of register) env.out(`- ${s.client}: ${s.describe}`);
     return 0;
   }
+  if (process.env.GROKLINK_TRANSPORT)
+    env.out(
+      "GROKLINK_TRANSPORT is set, but it isn't saved in the LaunchAgent: the installed daemon always starts in pipe mode (port0 lets every account on this Mac reach Grok Bot).",
+    );
   // The LaunchAgent goes first: if it fails, no client config has been touched.
   mkdirSync(env.stateHome, { recursive: true, mode: 0o700 });
   w.write(p.plist, plist(env));

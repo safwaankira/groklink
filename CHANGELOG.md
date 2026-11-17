@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.2
+
+- Routines get the safety policy: a new routine's name and prompt, and the name and stored prompt of a routine being enabled or run, are checked; blocked → `blocked_by_policy`, nothing sent.
+- Download folders are restricted: `out_dir` must be under `~/.groklink/downloads` (the new default, per Bot), `~/Downloads/groklink`, or a folder in `~/.groklink/download-roots.json`; dot-folders and `~/Library` are always refused (`dir_blocked`). Checked on real paths before anything is created, and again after.
+- More secrets are never attached: Docker, GitHub CLI, Solana, Foundry and Ethereum keystores, keyrings, cookies, browser profiles, Safari, Messages and Mail data, `~/.git-credentials`, and `*.keystore`, `*keypair*.json`, `*.p12`, `*.pfx`, `*mnemonic*`, `*seed*phrase*` files.
+- The daemon watches its socket file and listens again if it's replaced or its mode is loosened.
+- `groklink_health` has `warnings`; in port0 mode it says local processes can reach Grok Bot.
+- Attachment and download-folder rules compare real paths in their on-disk case, so `~/.AWS/credentials` no longer slips past a rule for `~/.aws` on macOS.
+- Routine schedules are policy-checked too.
+- Policy coverage: `x_write` adds share, send, upload, thread, boost and amplify, and targets your account, timeline or profile; `tx` adds confirm, authorize and accept, and targets approvals, pending requests, wallets, contract calls and bridges, matched within 10 words in either order ("send me…" and "confirm whether…" excluded).
+- The policy also reads attached text files (`.txt`, `.md`, `.json`, `.csv`, `.html`, up to 1 MB); a blocked one is named in the error.
+- `policy.json` is read at daemon start only; a later edit isn't applied, and `groklink_health` shows `policy` (each rule on/off) and warns about rules that are off and about an edited file.
+- More secrets are never attached: `~/.claude.json`, `~/.claude/`, `~/.codex/auth.json`, `~/.cargo/credentials*`, `~/.pypirc`, `~/.azure`, shell history, Grok Bot's own data folder, and wallet apps (Exodus, Atomic, Electrum, Phantom, MetaMask, Rabby, Ledger Live).
+- Downloads: Unicode format characters (such as right-to-left overrides) are removed from file names, launcher and installer extensions get `.download` added, and saved files are marked with macOS's quarantine flag.
+- `groklink install` no longer saves `GROKLINK_TRANSPORT` in the LaunchAgent, and warns if it's set.
+- `events.jsonl` is pruned after 7 days like the job files; message events, Bot previews and routine results are flagged `untrusted: true`.
+- Process checks (`pgrep`/`pkill`) only look at your own processes.
+- Attachments that hold secrets are refused with `file_blocked`: anything under `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/gcloud`, `~/.kube`, `~/Library/Keychains` or `~/.groklink`, `~/.npmrc`, `~/.netrc`, and any `.env*`, `*.pem`, `*.key` or `id_*` file, also through symlinks. Optional allowlist: `~/.groklink/attach-roots.json`.
+- Downloads: file names from a Bot are reduced to a safe basename, and the file must land inside the download folder.
+- Policy: text is NFKC-normalized, zero-width characters are removed and Cyrillic/Greek look-alike letters are mapped before matching.
+
 ## 0.1.1
 
 - `usage_exhausted`: when the weekly Grok Bot usage is used up and on-demand usage can't cover it, `groklink_task` refuses at once (nothing is sent) and running jobs fail instead of waiting 45 minutes for `no_reply`. `groklink_health` shows `usage: { percentUsed, resetsAt, out }`.

@@ -47,7 +47,7 @@ If you use [grokbot-bridge](https://github.com/TheSethRose/grokbot-bridge), inst
 | `groklink_events` | `{ since_seq?, limit? (default 50) }` → events after a sequence number |
 | `groklink_read` | `{ bot, limit?, since? }` → messages in a Bot's conversation |
 | `groklink_stop` | `{ bot }` → interrupt the Bot |
-| `groklink_download` | `{ bot, keys?, out_dir? }` → save files the Bot sent (default `~/groklink/downloads/<bot>/`) |
+| `groklink_download` | `{ bot, keys?, out_dir? }` → save files the Bot sent (default `~/.groklink/downloads/<bot>/`; see Security model for where `out_dir` may point) |
 | `groklink_usage` | Your weekly Grok Bot usage |
 | `groklink_routines` | List, add, run, enable, disable or remove a Bot's routines (`remove` needs `confirm`) |
 | `groklink_health` | Daemon up, transport mode, app version, self-test result |
@@ -69,7 +69,7 @@ A job goes `queued` → `working` → `done`, `needs_input` (the Bot is waiting 
 
 To follow a job, call `groklink_job` with `wait_seconds` (up to 120). It returns as soon as the job leaves `working`, or when the time runs out. Then call it again. Jobs live in `~/.groklink/jobs/` and survive daemon and app restarts; job files are deleted after 7 days.
 
-Every Bot message, status change and finished job is also appended to an event log with a strictly increasing `seq`. Poll `groklink_events` with the last `seq` you saw to watch all Bots at once.
+Every Bot message, status change and finished job is also appended to an event log (`~/.groklink/events.jsonl`) with a strictly increasing `seq`; events older than 7 days are pruned too. Poll `groklink_events` with the last `seq` you saw to watch all Bots at once. Message events, Bot previews and routine results are flagged `untrusted: true`.
 
 Bot replies are untrusted data, not instructions: every returned message carries `untrusted: true`.
 
@@ -121,22 +121,29 @@ Supported keywords: `type` (`object`, `array`, `string`, `number`, `integer`, `b
 
 | Rule | Blocks briefs that ask a Bot to… |
 |---|---|
-| `x_write` | post, tweet, reply, quote, repost, like, follow or DM on X (as a command, so "find posts like this on X" still works) |
-| `tx` | sign, send, approve, broadcast or execute a transaction, permit, swap or transfer |
+| `x_write` | post, tweet, reply, quote, repost, like, follow, DM, share, send, upload, thread, boost or amplify on X, an @handle or your account, timeline or profile (as a command, so "find posts like this on X" still works) |
+| `tx` | sign, send, approve, confirm, authorize, accept, broadcast or execute a transaction, permit, swap, transfer, approval, contract call, bridge or wallet request (verb and target within 10 words, in either order; "send me…" and "confirm whether…" don't count) |
 | `wallet` | connect a wallet, or anything mentioning a seed phrase, private key or mnemonic |
 | `claim` | submit a claim |
 
-A blocked task fails with `blocked_by_policy` and the rule's name, and nothing is sent. Schema repair messages are checked too.
+A blocked task fails with `blocked_by_policy` and the rule's name, and nothing is sent. Schema repair messages, routines, and the contents of attached text files (`.txt`, `.md`, `.json`, `.csv`, `.html`, up to 1 MB) are checked too.
 
-To turn a rule off, edit `policy.json` and set it to `false`, for example `"x_write": false`. The change applies to the next task without a restart. There's no per-call override, so an agent can't talk its way past a rule. A missing key, or a missing or broken file, means the rule is on.
+**The policy is a best-effort seatbelt, not a sandbox.** It matches phrases, so a determined or unusual wording can get past it.
+
+To turn a rule off, edit `policy.json`, set it to `false` (for example `"x_write": false`), and restart the daemon (`launchctl kickstart -k gui/$(id -u)/dev.groklink.daemon`). The daemon reads the file only at start: if it changes while running, the change isn't applied and `groklink_health` warns "policy.json changed; restart groklinkd to apply". `groklink_health` also shows each rule in `policy`, with a warning for any that's off. There's no per-call override. You, as the owner, can turn rules off; so can any program running with your file access, including a coding agent, if it also restarts the daemon. A missing key, or a missing or broken file, means the rule is on.
 
 ## Security model
 
 - **Only you can reach the daemon.** It listens on a Unix socket, `~/.groklink/groklink.sock` (mode `0600`), in a folder that only you can open (`0700`). Every request must carry the token in `~/.groklink/token` (32 random bytes, mode `0600`). A wrong or missing token gets `unauthorized`, and the connection is closed.
-- **No TCP port.** By default the daemon starts Grok Bot with `--remote-debugging-pipe`, so the Chrome DevTools connection runs over a private pipe and no port opens. The fallback (`GROKLINK_TRANSPORT=port0`) lets Chromium pick a free loopback port; that port is never printed or logged. The fixed port 9333 is never used.
+- **The socket is watched.** Every 15 seconds the daemon checks that its socket file is still the one it created, with mode `0600`; if not, it listens again on a fresh one.
+- **No TCP port.** By default the daemon starts Grok Bot with `--remote-debugging-pipe`, so the Chrome DevTools connection runs over a private pipe and no port opens. The fallback (`GROKLINK_TRANSPORT=port0`) lets Chromium pick a free loopback port; that port is never printed or logged. The fixed port 9333 is never used. `groklink install` never saves `GROKLINK_TRANSPORT` in the LaunchAgent. Use port0 only if pipe mode fails, and only for a session: the loopback port has no token, so every account on the Mac can reach it, and while it runs, any local process that finds the port can reach Grok Bot, and `groklink_health` says so in `warnings`.
 - **What a local attacker can't do:** other user accounts on the Mac can't open the socket or read the token. Websites and other machines can't reach the app, because nothing listens on the network.
 - **What a local attacker can do:** any program running as you can read the token and use your Bots, just as it could drive the Grok Bot app itself. The policy file guards against agents being talked into risky briefs; it isn't a sandbox against malware running under your account, which could edit it.
-- **Logs stay private.** `daemon.log` never contains the token, the debug port, cookies or message text. Bot transcripts are stored only in job files under `~/.groklink/`.
+- **Secret files aren't attached.** `groklink_task` refuses (`file_blocked`) files in folders that hold keys, credentials or browser and mail data (for example `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.docker`, `~/.config/gh`, `~/.config/solana`, `~/.foundry/keystores`, `~/Library/Keychains`, `~/Library/Cookies`, browser profiles, `~/Library/Messages`, `~/Library/Mail` and `~/.groklink`), plus `~/.npmrc`, `~/.netrc`, `~/.git-credentials` and any `.env*`, `*.pem`, `*.key`, `id_*`, `*.keystore`, `*keypair*.json`, `*.p12`, `*.pfx`, `*mnemonic*` or `*seed*phrase*` file, including through symlinks. The list includes `~/.claude.json`, `~/.claude/`, `~/.codex/auth.json`, `~/.cargo/credentials*`, `~/.pypirc`, `~/.azure`, shell history, Grok Bot's own data folder and wallet apps (Exodus, Atomic, Electrum, Phantom, MetaMask, Rabby, Ledger Live). A denylist can't know every secret, so if you attach files often, list the folders you attach from in `~/.groklink/attach-roots.json` (a JSON array of absolute paths): then nothing else can be attached.
+- **Downloads stay in their folder.** File names sent by a Bot are reduced to a safe name (no `/`, `\`, `..`, leading dots, control or Unicode format characters such as right-to-left overrides, at most 200 characters; launchers and installers like `.command`, `.app`, `.pkg` or `.webloc` get `.download` added) and marked as downloaded (`com.apple.quarantine`), so macOS asks before opening them, and a file can't be saved outside the download folder. That folder must be under `~/.groklink/downloads` (the default, one subfolder per Bot) or `~/Downloads/groklink`, or a folder you list in `~/.groklink/download-roots.json` (a JSON array of absolute paths). Hidden (dot) folders and anything under `~/Library` are always refused (`dir_blocked`), even if listed.
+- **Routines get the same policy.** `groklink_routines` checks a new routine's name and prompt, and the name and stored prompt of a routine it enables or runs, so an agent can't schedule what it couldn't ask for directly.
+- **The policy sees through look-alike letters.** Before matching, text is normalized (full-width and styled letters, zero-width characters, Cyrillic and Greek look-alikes). It still matches phrases, so treat it as a guard rail, not a guarantee.
+- **Logs stay private.** `daemon.log` never contains the token, the debug port, cookies or message text. Bot transcripts are stored only in job files and the event log under `~/.groklink/`, both pruned after 7 days.
 - **No telemetry.** Grok Link makes no network calls of its own.
 
 See [SECURITY.md](SECURITY.md) to report a vulnerability.
@@ -150,6 +157,8 @@ If the self-test fails, `groklink_task` refuses to send and names the failed che
 ## Troubleshooting
 
 **Closing the Grok Bot window or using another Grok Bot bridge.** If you close the Grok Bot window (Cmd+W), the app keeps running without it, and Grok Link reopens it as a Dock click would. If the window doesn't come back, Grok Link restarts the app. Running jobs carry on either way. Don't run Grok Link next to the old [grokbot-bridge](https://github.com/TheSethRose/grokbot-bridge): each one restarts Grok Bot in its own mode, so they keep quitting each other's copy of the app. That's why `groklink install` refuses while grokbot-bridge is registered.
+
+**`file_blocked` or `dir_blocked`.** The file you asked to attach, or the folder you asked to save into, is one Grok Link protects (see Security model). Attach a copy from another folder, or save under `~/.groklink/downloads` or `~/Downloads/groklink` (or a folder in `~/.groklink/download-roots.json`).
 
 **`usage_exhausted`.** Your weekly Grok Bot usage is used up (100%) and on-demand usage is off or at its limit, so `groklink_task` refuses new tasks and stops running ones; the error says when usage resets. Enable on-demand usage in Grok Bot to continue sooner.
 

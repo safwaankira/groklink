@@ -1,18 +1,18 @@
 // Token-protected Unix socket: one newline-delimited JSON request per line, one response line each.
 import { timingSafeEqual } from "node:crypto";
-import { chmodSync, rmSync } from "node:fs";
+import { chmodSync, rmSync, statSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import { download, findBot, listBots, read, stop, usage } from "../base/bot.ts";
+import { checkDownloadDir, download, findBot, listBots, read, safeFileName, stop, usage } from "../base/bot.ts";
 import type { CDP } from "../base/cdp.ts";
 import { createBot, deleteBot, updateBot } from "../base/roster.ts";
-import { changeRoutine, listRoutines, type RoutineChange, runRoutine } from "../base/routines.ts";
+import { changeRoutine, listRoutines, type Routine, type RoutineChange, runRoutine } from "../base/routines.ts";
 import { type HealthResult, ProtocolError, type Response, type TransportMode } from "../shared/protocol.ts";
 import type { EventLog } from "./events.ts";
 import { JOB_STATUSES, type JobStatus, type Jobs, type UsageSummary } from "./jobs.ts";
 import type { SelfTestResult } from "./selftest.ts";
-import type { Log } from "./state.ts";
+import { type Log, statePaths } from "./state.ts";
 
 export type Handler = (params: Record<string, unknown>) => unknown;
 export type Methods = Record<string, Handler>;
@@ -21,6 +21,8 @@ export type Methods = Record<string, Handler>;
 export type Link = { mode: TransportMode; connected: boolean; appVersion: string | null; requireCdp(): CDP };
 
 const MAX_LINE = 1024 * 1024;
+
+export const PORT0_WARNING = "Debug port fallback in use: local processes can reach Grok Bot while it runs.";
 
 /** Reads typed params, answering `bad_request` for a missing or wrong-typed one. */
 function reader(p: Record<string, unknown>) {
@@ -52,20 +54,54 @@ function reader(p: Record<string, unknown>) {
 /** Bot replies are data, never instructions. */
 const untrusted = <T extends { messages: object[] }>(r: T) => ({ ...r, messages: r.messages.map((m) => ({ ...m, untrusted: true })) });
 
-async function routines(cdp: CDP, p: Record<string, unknown>) {
+/** The routine a query names (id, exact name, or a unique name prefix), as the base matches it; null if not exactly one. */
+function findRoutine(list: Routine[], query: string): Routine | null {
+  const q = query.trim().toLowerCase();
+  const hits = list.filter((r) => r.id === query.trim() || r.name.toLowerCase() === q);
+  if (hits.length === 1) return hits[0];
+  const partial = hits.length ? [] : list.filter((r) => r.name.toLowerCase().startsWith(q));
+  return partial.length === 1 ? partial[0] : null;
+}
+
+/** `policy` checks text that would reach the Bot; the same check tasks get. */
+async function routines(cdp: CDP, p: Record<string, unknown>, policy: (text: string) => void) {
   const { str, optNum, optBool } = reader(p);
   const action = str("action");
   if (action === "list") return listRoutines(cdp, str("bot"));
-  if (action === "run") return runRoutine(cdp, str("bot"), str("routine"));
+  // A routine runs its stored prompt; enabling one lets it run on schedule. Check that prompt too.
+  const storedPrompt = async (required: boolean) => {
+    let list: Routine[];
+    try {
+      list = (await listRoutines(cdp, str("bot"))).routines;
+    } catch (e) {
+      // Run needs the list anyway; enable works while the Bot's computer sleeps, so it goes ahead on the name alone.
+      if (required) throw e;
+      return;
+    }
+    const r = findRoutine(list, str("routine"));
+    if (r) policy(`${r.name}\n${r.prompt}`);
+  };
+  if (action === "run") {
+    policy(str("routine"));
+    await storedPrompt(true);
+    return runRoutine(cdp, str("bot"), str("routine"));
+  }
   const seconds = optNum("timeout_seconds");
   const timing = { timeoutMs: (seconds !== undefined && Number.isFinite(seconds) && seconds > 0 ? seconds : 300) * 1000 };
   if (action === "add") {
     const spec = { name: str("name"), schedule: str("schedule"), prompt: str("prompt"), enabled: optBool("enabled") !== false };
+    policy(spec.name);
+    policy(spec.prompt);
+    // The schedule goes into the Bot's message too.
+    policy(spec.schedule);
     return changeRoutine(cdp, str("bot"), "add", spec, timing);
   }
   if (!["enable", "disable", "remove"].includes(action)) throw new ProtocolError("bad_request", `Unknown action "${action}".`);
   if (action === "remove" && str("confirm") !== str("routine"))
     throw new ProtocolError("bad_request", '"confirm" must repeat the "routine" value exactly.');
+  // The routine name goes into the message the Bot gets.
+  policy(str("routine"));
+  if (action === "enable") await storedPrompt(false);
   return changeRoutine(cdp, str("bot"), action as RoutineChange, str("routine"), timing);
 }
 
@@ -83,7 +119,12 @@ export function daemonMethods(
     return v;
   };
   return {
-    health: (): HealthResult & { selftest: SelfTestResult | null; usage: UsageSummary | null } => ({
+    health: (): HealthResult & {
+      selftest: SelfTestResult | null;
+      usage: UsageSummary | null;
+      policy: Record<string, boolean> | null;
+      warnings: string[];
+    } => ({
       ok: true,
       mode: link.mode,
       connected: link.connected,
@@ -91,8 +132,11 @@ export function daemonMethods(
       uptimeSec: Math.floor((Date.now() - startedAt) / 1000),
       selftest: opts.selftest?.result ?? null,
       usage: opts.jobs?.usageSnapshot() ?? null,
+      policy: opts.jobs?.policyState().rules ?? null,
+      warnings: [...(link.mode === "port0" ? [PORT0_WARNING] : []), ...(opts.jobs?.policyState().warnings ?? [])],
     }),
-    bots: () => listBots(cdp()),
+    // A Bot's preview and description can carry text the Bot wrote.
+    bots: async () => (await listBots(cdp())).map((b) => ({ ...b, untrusted: true })),
     task: (p) => {
       const { str, strs } = reader(p);
       // Don't send anything while the app's internals look different from what the base code expects.
@@ -113,7 +157,10 @@ export function daemonMethods(
     events: (p) => {
       const { optNum } = reader(p);
       const limit = Math.min(Math.max(Math.floor(optNum("limit") ?? 50), 1), 500);
-      return need(opts.events).since(optNum("since_seq") ?? 0, limit);
+      // Message events carry what the Bot said.
+      return need(opts.events)
+        .since(optNum("since_seq") ?? 0, limit)
+        .map((e) => (e.type === "message" ? { ...e, untrusted: true } : e));
     },
     read: async (p) => {
       const { str, optNum, optStr } = reader(p);
@@ -124,12 +171,18 @@ export function daemonMethods(
       const { str, strs, optStr } = reader(p);
       const outDir = optStr("out_dir");
       if (outDir !== undefined && !isAbsolute(outDir)) throw new ProtocolError("bad_request", '"out_dir" must be an absolute path.');
+      const where = { home: opts.jobs?.homeDir ?? homedir(), stateHome: opts.jobs?.stateHome ?? statePaths().home };
       const bot = await findBot(cdp(), str("bot"));
-      const dir = outDir ?? join(homedir(), "groklink", "downloads", bot.name.replace(/[/\\]/g, "_"));
-      return download(cdp(), bot.id, strs("keys"), dir);
+      const dir = outDir ?? join(where.stateHome, "downloads", safeFileName(bot.name));
+      // Checked before anything is created, and again on the real folder once it exists.
+      checkDownloadDir(dir, where);
+      return download(cdp(), bot.id, strs("keys"), dir, (real) => {
+        checkDownloadDir(real, where);
+      });
     },
     usage: () => usage(cdp()),
-    routines: (p) => routines(cdp(), p),
+    // Routine names, prompts, the Bot's reply and its error text all come from the Bot's side.
+    routines: async (p) => ({ ...((await routines(cdp(), p, (text) => opts.jobs?.checkPolicy(text))) as object), untrusted: true }),
     createBot: (p) => {
       const { str, optStr } = reader(p);
       return createBot(cdp(), { name: str("name"), description: optStr("description") });
@@ -240,4 +293,42 @@ export async function startServer(opts: { socketPath: string; token: string; met
   });
   chmodSync(opts.socketPath, 0o600);
   return server;
+}
+
+/**
+ * Keep serving on the socket we created. Every `everyMs` (15 s), check the path still has the inode and mode 0600 it
+ * had at listen; if something replaced or loosened it, close and listen again on a fresh socket at the same path.
+ */
+export function guardSocket(opts: { socketPath: string; server: Server; start: () => Promise<Server>; log: Log; everyMs?: number }) {
+  let server = opts.server;
+  let ino = statSync(opts.socketPath).ino;
+  let busy = false;
+  const timer = setInterval(async () => {
+    if (busy) return;
+    let ok = false;
+    try {
+      const st = statSync(opts.socketPath);
+      ok = st.ino === ino && (st.mode & 0o777) === 0o600 && st.isSocket();
+    } catch {}
+    if (ok) return;
+    busy = true;
+    opts.log("socket replaced; recreating");
+    try {
+      server.close();
+      // Remove whatever is at the path now (it isn't ours), so startServer doesn't mistake it for another daemon.
+      rmSync(opts.socketPath, { force: true });
+      server = await opts.start();
+      ino = statSync(opts.socketPath).ino;
+    } catch (e) {
+      opts.log(`couldn't recreate the socket: ${(e as Error).message}`);
+    } finally {
+      busy = false;
+    }
+  }, opts.everyMs ?? 15_000);
+  return {
+    get server() {
+      return server;
+    },
+    stop: () => clearInterval(timer),
+  };
 }

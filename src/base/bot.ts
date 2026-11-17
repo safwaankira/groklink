@@ -3,8 +3,12 @@
 // works for any Bot without switching the conversation on screen, and waiting is
 // driven by the stores' change events rather than by polling the screen.
 // Store and field names are internal to Grok Bot (0.71.x); see page.ts.
-import { mkdir, open as openFile, readFile, stat } from "node:fs/promises";
-import { basename, extname, join, resolve } from "node:path";
+import { execFile } from "node:child_process";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { mkdir, open as openFile, readFile, realpath, stat } from "node:fs/promises";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { promisify } from "node:util";
+import { ProtocolError } from "../shared/protocol.ts";
 import type { CDP } from "./cdp.ts";
 import { ACCOUNT_SLOT, PAGE_ERROR, store } from "./page.ts";
 
@@ -423,13 +427,130 @@ export async function stop(cdp: CDP, botQuery: string): Promise<{ bot: string; s
 
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 
+const MAX_NAME = 200;
+
+/**
+ * A file name sent by a Bot, reduced to a safe basename: only the part after the last `/` or `\`, without
+ * control characters (NUL included), `..` runs or leading dots, at most 200 characters. Empty → "file".
+ */
+export function safeFileName(name: string): string {
+  let s = Array.from(String(name))
+    .filter((c) => c.charCodeAt(0) >= 0x20 && c.charCodeAt(0) !== 0x7f)
+    .join("")
+    // Format characters (Unicode Cf, e.g. U+202E right-to-left override) can make "x\u202efdp.command" look like a PDF.
+    .replace(/\p{Cf}/gu, "")
+    .split(/[/\\]/)
+    .pop() as string;
+  s = s
+    .replace(/\.{2,}/g, ".")
+    .replace(/^[.\s]+/, "")
+    .trim();
+  if (s.length > MAX_NAME) {
+    const ext = extname(s);
+    s = ext.length > 0 && ext.length <= 20 ? s.slice(0, MAX_NAME - ext.length) + ext : s.slice(0, MAX_NAME);
+  }
+  s ||= "file";
+  // Launchers and installers open or run on a double-click; make them inert until the user renames them on purpose.
+  return RISKY_EXTENSIONS.includes(extname(s).toLowerCase()) ? `${s}.download` : s;
+}
+
+const RISKY_EXTENSIONS = [
+  ".app",
+  ".command",
+  ".terminal",
+  ".tool",
+  ".sh",
+  ".pkg",
+  ".dmg",
+  ".scpt",
+  ".applescript",
+  ".workflow",
+  ".webloc",
+  ".inetloc",
+  ".fileloc",
+  ".jar",
+];
+
+/** macOS: mark a saved file as downloaded, so Gatekeeper asks before it opens or runs. Never throws. */
+export async function quarantine(
+  file: string,
+  run: (cmd: string, args: string[]) => Promise<unknown> = promisify(execFile),
+): Promise<boolean> {
+  if (process.platform !== "darwin") return false;
+  const value = `0081;${Math.floor(Date.now() / 1000).toString(16)};GrokLink;`;
+  try {
+    await run("xattr", ["-w", "com.apple.quarantine", value, file]);
+    return true;
+  } catch {
+    console.error("groklink: couldn't set the quarantine attribute on a downloaded file");
+    return false;
+  }
+}
+
+/** A path's real location even if it doesn't exist yet: the nearest existing parent's real path plus the rest. */
+function realOrPending(p: string): string {
+  const parts: string[] = [];
+  let cur = resolve(p);
+  while (!existsSync(cur)) {
+    parts.unshift(basename(cur));
+    const up = dirname(cur);
+    if (up === cur) break;
+    cur = up;
+  }
+  // `.native` gives the on-disk case, so case variants of a folder compare equal on macOS's case-insensitive disks.
+  return join(realpathSync.native(cur), ...parts);
+}
+
+const inside = (p: string, dir: string) => p === dir || p.startsWith(dir + sep);
+
+/**
+ * Where downloads may be saved: under `$GROKLINK_HOME/downloads`, `~/Downloads/groklink`, or a folder listed in
+ * `$GROKLINK_HOME/download-roots.json` (absolute paths). Below any root, and for listed roots themselves, a dot-folder
+ * segment (`.ssh`, `.config`…) or anything under `~/Library` is refused. Checked on real paths (after symlinks),
+ * without creating anything. Returns the real path; throws `dir_blocked`.
+ */
+export function checkDownloadDir(dir: string, ctx: { home: string; stateHome: string }): string {
+  const blocked = (why: string) => new ProtocolError("dir_blocked", `Grok Link won't save files in ${dir}: ${why}. Nothing was saved.`);
+  if (!isAbsolute(dir)) throw blocked("it isn't an absolute path");
+  const real = realOrPending(dir);
+  const home = realOrPending(ctx.home);
+  const library = join(home, "Library");
+  const dotSegment = (p: string) => p.split(sep).some((seg) => seg.startsWith(".") && seg !== "." && seg.length > 1);
+  const builtIn = [join(ctx.stateHome, "downloads"), join(ctx.home, "Downloads", "groklink")].map(realOrPending);
+  let extra: string[] = [];
+  const rootsFile = join(ctx.stateHome, "download-roots.json");
+  if (existsSync(rootsFile)) {
+    let listed: unknown;
+    try {
+      listed = JSON.parse(readFileSync(rootsFile, "utf8"));
+    } catch {
+      throw blocked(`${rootsFile} isn't valid JSON`);
+    }
+    if (!Array.isArray(listed) || listed.some((r) => typeof r !== "string" || !isAbsolute(r)))
+      throw blocked(`${rootsFile} must be an array of absolute folder paths`);
+    // A listed root can't open up dot-folders or ~/Library.
+    extra = (listed as string[]).map(realOrPending).filter((r) => !dotSegment(r) && !inside(r, library));
+  }
+  const root = [...builtIn, ...extra].find((r) => inside(real, r));
+  if (!root) throw blocked(`it's outside the allowed download folders (${builtIn.join(", ")}, or ones listed in ${rootsFile})`);
+  const below = relative(root, real);
+  if (dotSegment(below)) throw blocked("it's inside a hidden (dot) folder");
+  if (!builtIn.includes(root) && inside(real, library)) throw blocked("it's under ~/Library");
+  return real;
+}
+
 /** Writes to `dir/name`, adding " (1)", " (2)"… instead of overwriting an existing file. */
-async function writeNew(dir: string, name: string, data: Buffer): Promise<string> {
+async function writeNew(dir: string, name: string, data: Buffer, verify?: (realDir: string) => void): Promise<string> {
   await mkdir(dir, { recursive: true });
+  // The file must land directly in `dir` (its real path), never beside or above it.
+  const root = await realpath(dir);
+  // Check the folder again now that it exists, in case a symlink appeared on the way.
+  verify?.(root);
   const ext = extname(name);
   const stem = name.slice(0, name.length - ext.length) || "file";
   for (let n = 0; ; n++) {
-    const target = join(dir, n ? `${stem} (${n})${ext}` : name);
+    const target = join(root, n ? `${stem} (${n})${ext}` : name);
+    if (dirname(target) !== root) throw new Error("The file name would save outside the download folder; nothing was saved.");
     const fh = await openFile(target, "wx").catch((e: NodeJS.ErrnoException) => {
       if (e.code === "EEXIST") return null;
       throw e;
@@ -440,6 +561,7 @@ async function writeNew(dir: string, name: string, data: Buffer): Promise<string
     } finally {
       await fh.close();
     }
+    await quarantine(target);
     return target;
   }
 }
@@ -450,7 +572,13 @@ export type Download = { name: string; from: string; savedTo: string; bytes: num
  * Save files from a conversation to `outDir`. `keys` picks file messages; with none, saves the
  * newest file the Bot sent. Existing local files are never overwritten.
  */
-export async function download(cdp: CDP, botQuery: string, keys: string[], outDir = "."): Promise<{ bot: string; files: Download[] }> {
+export async function download(
+  cdp: CDP,
+  botQuery: string,
+  keys: string[],
+  outDir = ".",
+  verifyDir?: (realDir: string) => void,
+): Promise<{ bot: string; files: Download[] }> {
   const { bot, messages } = await read(cdp, botQuery, { limit: 1000 });
   const id = (await findBot(cdp, bot)).id;
   const withFiles = messages.filter((m) => m.file);
@@ -467,7 +595,7 @@ export async function download(cdp: CDP, botQuery: string, keys: string[], outDi
   for (const m of picked) {
     const file = m.file as { name: string; path: string };
     const data = Buffer.from(await cdp.call<string>(PAGE_DOWNLOAD, id, file.path, MAX_DOWNLOAD_BYTES), "base64");
-    const savedTo = await writeNew(resolve(outDir), basename(file.name), data);
+    const savedTo = await writeNew(resolve(outDir), safeFileName(file.name), data, verifyDir);
     files.push({ name: file.name, from: file.path, savedTo, bytes: data.length });
   }
   return { bot, files };

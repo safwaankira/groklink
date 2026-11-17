@@ -159,11 +159,19 @@ test("daemon start creates policy.json; a blocked brief creates no job and sends
   assert.deepEqual(j.list(), []);
 });
 
-test("turning a rule off in policy.json takes effect without a restart", async () => {
+test("policy.json is read at start only: a later edit isn't applied, and health warns until a restart", async () => {
   const { j, sent } = setup();
   writeFileSync(join(home, "policy.json"), '{ "tx": false }');
-  await j.create({ bot: "Alpha", brief: "sign the transaction" });
-  await until(() => sent.length === 1);
+  await until(() => j.policyState().warnings.includes("policy.json changed; restart groklinkd to apply"));
+  await assert.rejects(j.create({ bot: "Alpha", brief: "sign the transaction" }), { code: "blocked_by_policy", rule: "tx" });
+  assert.deepEqual(j.policyState().rules, { x_write: true, tx: true, wallet: true, claim: true });
+  // After a restart the edit applies, and health says the rule is off.
+  const restarted = setup();
+  assert.deepEqual(restarted.j.policyState().rules, { x_write: true, tx: false, wallet: true, claim: true });
+  assert.deepEqual(restarted.j.policyState().warnings, ["Safety rule tx is off (policy.json)."]);
+  await restarted.j.create({ bot: "Alpha", brief: "sign the transaction" });
+  await until(() => restarted.sent.length === 1);
+  assert.deepEqual(sent, []);
 });
 
 test("a schema repair message that breaks a rule isn't sent; the job fails with the rule", async () => {

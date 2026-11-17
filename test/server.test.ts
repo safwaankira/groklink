@@ -127,7 +127,11 @@ test("health works with the right token", async () => {
 
 test("bots returns the list from the CDP channel", async () => {
   const { reply } = await rpc(paths().socket, { id: 4, token, method: "bots" });
-  assert.deepEqual(reply.result, BOTS);
+  // Bot previews and descriptions are Bot text, so each Bot is flagged.
+  assert.deepEqual(
+    reply.result,
+    BOTS.map((b) => ({ ...b, untrusted: true })),
+  );
 });
 
 test("an unknown method gets bad_request", async () => {
@@ -150,7 +154,10 @@ test("Bot methods return not_connected until the page's stores are ready", async
     page.ready = true;
     for (const t0 = Date.now(); !transport.connected; await sleep(5)) if (Date.now() - t0 > 2000) throw new Error("timed out");
     assert.equal((methods.health({}) as { connected: boolean }).connected, true);
-    assert.deepEqual(await methods.bots({}), BOTS);
+    assert.deepEqual(
+      await methods.bots({}),
+      BOTS.map((b) => ({ ...b, untrusted: true })),
+    );
   } finally {
     await transport.stop();
   }

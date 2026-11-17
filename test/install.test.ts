@@ -273,7 +273,7 @@ setTimeout(() => process.exit(0), 5000);
   const calls = readFileSync(join(home, "calls.log"), "utf8").trim().split("\n");
   const uid = process.getuid?.();
   assert.deepEqual(calls, [
-    `pgrep -a -x Claude`,
+    `pgrep -a -U ${uid} -x Claude`,
     `launchctl bootout gui/${uid}/${LABEL}`,
     `launchctl print gui/${uid}/${LABEL}`,
     `launchctl bootstrap gui/${uid} ${P.plist()}`,

@@ -1,12 +1,13 @@
 // Jobs: `task` sends a brief and returns at once; a daemon-side waiter follows the Bot and writes
 // what it says to $GROKLINK_HOME/jobs/<jobId>.json. One job runs per Bot at a time; others queue.
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { findBot, type Message, read, send, type Usage, usage, type WaitResult, wait } from "../base/bot.ts";
 import type { CDP } from "../base/cdp.ts";
 import { BOX_PHASE } from "../base/page.ts";
-import { enforce, ensurePolicy, PolicyError } from "../shared/policy.ts";
+import { check, ensurePolicy, loadPolicy, PolicyError, RULES, type Rule } from "../shared/policy.ts";
 import { ProtocolError, type RpcError } from "../shared/protocol.ts";
 import { lastJsonBlock, type Schema, validate } from "../shared/schema.ts";
 import type { EventLog, EventType } from "./events.ts";
@@ -90,6 +91,8 @@ export type JobsOptions = {
   usageCacheMs?: number;
   /** Milliseconds since the epoch; tests pass a fake clock. */
   clock?: () => number;
+  /** The user's home folder, for the sensitive-file rules. Tests pass a temp folder. */
+  home?: string;
 };
 
 const JOB_ID = /^j_[0-9a-f]{12}$/;
@@ -119,6 +122,204 @@ export const SLEEP_WARNING =
   "Bot's computer is asleep: the Grok Bot window has been in the background for 10+ minutes. Bring it to the front to wake it.";
 
 const now = () => new Date().toISOString();
+
+/** Folders under the home folder whose files are never attached. */
+const SENSITIVE_DIRS = [
+  ".ssh",
+  ".gnupg",
+  ".aws",
+  ".config/gcloud",
+  ".kube",
+  "Library/Keychains",
+  ".groklink",
+  ".docker",
+  ".config/gh",
+  ".config/solana",
+  ".foundry/keystores",
+  ".ethereum/keystore",
+  ".local/share/keyrings",
+  "Library/Cookies",
+  "Library/Application Support/Google/Chrome",
+  "Library/Application Support/BraveSoftware",
+  "Library/Application Support/Firefox",
+  "Library/Application Support/Arc",
+  "Library/Application Support/Microsoft Edge",
+  "Library/Safari",
+  "Library/Messages",
+  "Library/Mail",
+  ".claude",
+  ".azure",
+  "Library/Application Support/Grok Bot",
+  // Wallet apps
+  "Library/Application Support/Exodus",
+  "Library/Application Support/atomic",
+  "Library/Application Support/Electrum",
+  "Library/Application Support/Phantom",
+  "Library/Application Support/MetaMask",
+  "Library/Application Support/Rabby",
+  "Library/Application Support/Ledger Live",
+];
+/** Files in the home folder that are never attached. */
+const SENSITIVE_HOME_FILES = [
+  ".npmrc",
+  ".netrc",
+  ".git-credentials",
+  ".claude.json",
+  ".codex/auth.json",
+  ".pypirc",
+  ".zsh_history",
+  ".bash_history",
+  ".local/share/fish/fish_history",
+];
+/** Files in the home folder whose path starts like this (e.g. ~/.cargo/credentials and credentials.toml). */
+const SENSITIVE_HOME_PREFIXES = [".cargo/credentials"];
+/** File names that are never attached, wherever they are. */
+const SENSITIVE_NAMES = [
+  /^\.env/i,
+  /\.pem$/i,
+  /\.key$/i,
+  /^id_/i,
+  /\.keystore$/i,
+  /keypair.*\.json$/i,
+  /\.p12$/i,
+  /\.pfx$/i,
+  /mnemonic/i,
+  /seed.*phrase/i,
+  /^\.git-credentials$/i,
+];
+
+// `.native` returns the on-disk case. macOS disks ignore case, so plain `realpathSync` would let "~/.AWS/credentials"
+// slip past a rule written for "~/.aws".
+const realOr = (p: string) => {
+  try {
+    return realpathSync.native(p);
+  } catch {
+    return resolve(p);
+  }
+};
+const under = (p: string, dir: string) => p === dir || p.startsWith(dir + sep);
+
+/**
+ * Refuse attachments that hold secrets: anything under ~/.ssh, ~/.gnupg, ~/.aws, ~/.config/gcloud, ~/.kube,
+ * ~/Library/Keychains, ~/.groklink or the state folder; ~/.npmrc, ~/.netrc; and any .env*, *.pem, *.key or id_* file.
+ * Both the path as given and its real path (after symlinks) are checked. With `attach-roots.json` in the state
+ * folder (an array of absolute folders), only files under those folders are allowed.
+ */
+export function checkAttachment(file: string, opts: { home: string; stateHome: string }): void {
+  const blocked = (why: string) => new ProtocolError("file_blocked", `Grok Link won't attach ${file}: ${why}. Nothing was sent.`);
+  let real: string;
+  try {
+    real = realpathSync.native(file);
+  } catch {
+    throw new ProtocolError("bad_request", `File not found: ${file}`);
+  }
+  const given = resolve(file);
+  const dirs = [...SENSITIVE_DIRS.map((d) => join(opts.home, d)), opts.stateHome].flatMap((d) => [resolve(d), realOr(d)]);
+  const homeFiles = SENSITIVE_HOME_FILES.map((f) => join(opts.home, f)).flatMap((f) => [resolve(f), realOr(f)]);
+  for (const p of [given, real]) {
+    const prefixed = SENSITIVE_HOME_PREFIXES.some((f) => {
+      const full = join(opts.home, f);
+      return [resolve(full), join(realOr(dirname(full)), basename(full))].some((c) => p.startsWith(c));
+    });
+    if (dirs.some((d) => under(p, d)) || homeFiles.includes(p) || prefixed)
+      throw blocked("it's in a folder that holds keys or credentials");
+    if (SENSITIVE_NAMES.some((re) => re.test(basename(p)))) throw blocked("its name marks it as a key or secrets file");
+  }
+  const rootsFile = join(opts.stateHome, "attach-roots.json");
+  if (!existsSync(rootsFile)) return;
+  let roots: unknown;
+  try {
+    roots = JSON.parse(readFileSync(rootsFile, "utf8"));
+  } catch {
+    throw blocked(`${rootsFile} isn't valid JSON, so no file can be checked against it`);
+  }
+  if (!Array.isArray(roots) || roots.some((r) => typeof r !== "string" || !isAbsolute(r)))
+    throw blocked(`${rootsFile} must be an array of absolute folder paths`);
+  if (!roots.some((r) => under(real, realOr(r as string)))) throw blocked(`it's outside the folders listed in ${rootsFile}`);
+}
+
+/** Attached files whose text the policy also reads. */
+const TEXT_ATTACHMENT = /\.(txt|md|json|csv|html)$/i;
+const MAX_TEXT_ATTACHMENT = 1024 * 1024;
+
+/** The text of an attachment the policy should read, or null (not a text type, too big, or not UTF-8). */
+function attachmentText(file: string): string | null {
+  if (!TEXT_ATTACHMENT.test(file)) return null;
+  try {
+    if (statSync(file).size > MAX_TEXT_ATTACHMENT) return null;
+    return new TextDecoder("utf-8", { fatal: true }).decode(readFileSync(file));
+  } catch {
+    return null;
+  }
+}
+
+/** Zero-width and invisible characters that could split a word to slip past the policy. */
+const INVISIBLE = /\u034f|[\u00ad\u061c\u115f\u1160\u17b4\u17b5\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff]/g;
+/** Common Cyrillic and Greek look-alikes of Latin letters. */
+const HOMOGLYPHS: Record<string, string> = {
+  а: "a",
+  е: "e",
+  о: "o",
+  р: "p",
+  с: "c",
+  у: "y",
+  х: "x",
+  і: "i",
+  ј: "j",
+  ѕ: "s",
+  ԁ: "d",
+  һ: "h",
+  ӏ: "l",
+  ԛ: "q",
+  ԝ: "w",
+  А: "A",
+  В: "B",
+  Е: "E",
+  К: "K",
+  М: "M",
+  Н: "H",
+  О: "O",
+  Р: "P",
+  С: "C",
+  Т: "T",
+  Х: "X",
+  І: "I",
+  Ј: "J",
+  Ѕ: "S",
+  α: "a",
+  ε: "e",
+  ι: "i",
+  κ: "k",
+  ν: "v",
+  ο: "o",
+  ρ: "p",
+  τ: "t",
+  υ: "u",
+  χ: "x",
+  Α: "A",
+  Β: "B",
+  Ε: "E",
+  Ζ: "Z",
+  Η: "H",
+  Ι: "I",
+  Κ: "K",
+  Μ: "M",
+  Ν: "N",
+  Ο: "O",
+  Ρ: "P",
+  Τ: "T",
+  Υ: "Y",
+  Χ: "X",
+};
+const HOMOGLYPH_RE = new RegExp(`[${Object.keys(HOMOGLYPHS).join("")}]`, "g");
+
+/** Text as the policy sees it: NFKC-normalized (full-width and styled letters), invisible characters removed, look-alikes mapped. */
+export function policyText(text: string): string {
+  return text
+    .normalize("NFKC")
+    .replace(INVISIBLE, "")
+    .replace(HOMOGLYPH_RE, (c) => HOMOGLYPHS[c] ?? c);
+}
 
 /** The brief as sent: with a schema, it asks for the answer as a trailing json block. */
 export function wrapBrief(brief: string, schema: unknown): string {
@@ -171,6 +372,9 @@ export class Jobs {
   /** Per-job sleep-warning polls, cleared when the job's waiter ends or the daemon closes. */
   private watches = new Set<NodeJS.Timeout>();
   private usageCache: { at: number; value: Usage } | null = null;
+  /** The policy as read at start; later edits to policy.json aren't applied until a restart. */
+  private policy: { parsed: unknown; raw: string | null } | null = null;
+  private policyChanged = false;
   private closed = false;
 
   constructor(opts: JobsOptions) {
@@ -185,6 +389,7 @@ export class Jobs {
       usageEveryMs: 60_000,
       usageCacheMs: 60_000,
       clock: Date.now,
+      home: homedir(),
       policyFile: join(dirname(opts.dir), "policy.json"),
       ...opts,
     };
@@ -194,9 +399,11 @@ export class Jobs {
   start(): void {
     mkdirSync(this.o.dir, { recursive: true, mode: 0o700 });
     ensurePolicy(this.o.policyFile);
+    this.loadedPolicy();
     this.cleanup();
     let wasConnected = false;
     const poll = () => {
+      this.watchPolicy();
       const connected = this.o.link.connected;
       if (connected && !wasConnected) {
         void this.reload();
@@ -226,12 +433,25 @@ export class Jobs {
     const schema = params.schema ?? null;
     if (schema !== null && (typeof schema !== "object" || Array.isArray(schema)))
       throw new ProtocolError("bad_request", '"schema" must be a JSON Schema object.');
-    enforce(wrapBrief(brief, schema), this.o.policyFile);
+    this.enforce(wrapBrief(brief, schema));
     const u = await this.readUsage();
     if (u && usageOut(u)) throw new ProtocolError("usage_exhausted", usageMessage(u, "Nothing was sent."));
     const files = params.files ?? [];
     const relative = files.find((f) => !isAbsolute(f));
     if (relative !== undefined) throw new ProtocolError("bad_request", `File paths must be absolute: ${relative}`);
+    for (const f of files) checkAttachment(f, { home: this.o.home, stateHome: dirname(this.o.dir) });
+    // An attached text file can carry the instructions a brief can't.
+    for (const f of files) {
+      const text = attachmentText(f);
+      if (text === null) continue;
+      try {
+        this.enforce(text);
+      } catch (e) {
+        if (e instanceof PolicyError)
+          e.message = e.message.replace("Nothing was sent.", `(in attachment ${basename(f)}). Nothing was sent.`);
+        throw e;
+      }
+    }
     let bot: { id: string; name: string };
     try {
       bot = await this.o.layer.find(params.bot);
@@ -262,6 +482,58 @@ export class Jobs {
     // Sending can take seconds, so it happens after the reply.
     void this.next(job.botId);
     return { jobId: job.jobId, status: "queued" };
+  }
+
+  /** The user's home folder and the state folder (for the download-folder rules). */
+  get homeDir(): string {
+    return this.o.home;
+  }
+  get stateHome(): string {
+    return dirname(this.o.dir);
+  }
+
+  /** The policy check tasks get (normalized text, the live policy file), for other text sent to a Bot. */
+  checkPolicy(text: string): void {
+    this.enforce(text);
+  }
+
+  /** Each rule on or off as loaded at start, plus warnings: rules turned off, or policy.json edited since. */
+  policyState(): { rules: Record<Rule, boolean>; warnings: string[] } {
+    const parsed = this.loadedPolicy().parsed;
+    const rules = Object.fromEntries(
+      RULES.map((r) => [r, !(parsed && typeof parsed === "object" && (parsed as Record<string, unknown>)[r] === false)]),
+    ) as Record<Rule, boolean>;
+    const warnings = RULES.filter((r) => !rules[r]).map((r) => `Safety rule ${r} is off (policy.json).`);
+    if (this.policyChanged) warnings.push("policy.json changed; restart groklinkd to apply");
+    return { rules, warnings };
+  }
+
+  private enforce(text: string): void {
+    const r = check(policyText(text), this.loadedPolicy().parsed);
+    if (!r.ok) throw new PolicyError(r.rule);
+  }
+
+  private loadedPolicy(): { parsed: unknown; raw: string | null } {
+    if (!this.policy) {
+      let raw: string | null = null;
+      try {
+        raw = readFileSync(this.o.policyFile, "utf8");
+      } catch {}
+      this.policy = { parsed: loadPolicy(this.o.policyFile), raw };
+    }
+    return this.policy;
+  }
+
+  /** Notice (once) that policy.json was edited after start. The edit isn't applied: an agent with file access could make it. */
+  private watchPolicy(): void {
+    if (this.policyChanged) return;
+    let raw: string | null = null;
+    try {
+      raw = readFileSync(this.o.policyFile, "utf8");
+    } catch {}
+    if (raw === this.loadedPolicy().raw) return;
+    this.policyChanged = true;
+    this.o.log("policy.json changed; restart groklinkd to apply");
   }
 
   /** The full job. With `wait_seconds`, resolves when it's no longer being sent or `working`, or the time passes (max 120 s). */
@@ -381,7 +653,7 @@ export class Jobs {
   private async dispatch(job: Job): Promise<void> {
     const brief = wrapBrief(job.brief, job.schema);
     // The policy may have changed since the job was queued.
-    enforce(brief, this.o.policyFile);
+    this.enforce(brief);
     const sent = this.recovered.delete(job.jobId) ? await this.alreadySent(job, brief) : null;
     if (sent) this.o.log(`job ${job.jobId} brief was already sent before the restart; not sending again`);
     job.briefKey = sent ?? (await this.o.layer.send(job.botId, brief, job.files));
@@ -546,7 +818,7 @@ export class Jobs {
         }
         const repair = `Your JSON didn't match the schema: ${errors.slice(0, 5).join("; ")}. Send only the corrected json block.`;
         try {
-          enforce(repair, this.o.policyFile);
+          this.enforce(repair);
           anchor = await this.o.layer.send(job.botId, repair, []);
         } catch (e) {
           return this.finish(job, "failed", e instanceof PolicyError ? jobError(e) : { code: "internal", message: (e as Error).message });
@@ -629,6 +901,11 @@ export class Jobs {
   /** Delete job files (and leftover temp files) not written to for 7 days, except jobs still in progress. */
   private cleanup(): void {
     const cutoff = Date.now() - this.o.retentionMs;
+    try {
+      this.o.events.prune(this.o.retentionMs);
+    } catch {
+      this.o.log("couldn't prune events.jsonl");
+    }
     let names: string[];
     try {
       names = readdirSync(this.o.dir);
