@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { statePaths } from "../daemon/state.ts";
 import { call } from "./socket.ts";
 
@@ -29,6 +30,8 @@ export type InstallEnv = {
    * ancestors unless given `-a`, and install often runs from a Claude Code session inside Claude Desktop.
    */
   desktopRunning?(): boolean;
+  /** The packaged skills/groklink/SKILL.md; null if it can't be found. */
+  skillSource?: string | null;
   waitMs?: number;
   pollMs?: number;
   /** How long to wait for `launchctl bootout` to finish, how often to check, and the pause before retrying `bootstrap`. */
@@ -48,6 +51,7 @@ export function defaultEnv(): InstallEnv {
     onPath: (name) => (process.env.PATH ?? "").split(delimiter).some((d) => d && existsSync(join(d, name))),
     health: async () => (await call("health")) as Health,
     out: (line) => console.log(line),
+    skillSource: packagedSkill(),
     desktopRunning: () =>
       process.platform === "darwin" &&
       spawnSync("pgrep", ["-a", "-U", String(process.getuid?.() ?? ""), "-x", "Claude"], { stdio: "ignore" }).status === 0,
@@ -55,6 +59,61 @@ export function defaultEnv(): InstallEnv {
 }
 
 export type Options = { dryRun?: boolean; replaceGrokbotBridge?: boolean };
+
+const SKILL = join("skills", "groklink", "SKILL.md");
+
+/** skills/groklink/SKILL.md in the package: next to dist/ when built, two folders up from src/client/ in a checkout. */
+function packagedSkill(): string | null {
+  let dir = dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < 3; i++, dir = dirname(dir)) if (existsSync(join(dir, SKILL))) return join(dir, SKILL);
+  return null;
+}
+
+/**
+ * `groklink install --skill`: copy the agent skill to ~/.claude/skills/groklink/SKILL.md. An existing, different copy is
+ * kept unless `force`. Returns the exit code.
+ */
+export function installSkill(env: InstallEnv, opts: { force?: boolean; dryRun?: boolean } = {}): number {
+  try {
+    return copySkill(env, opts);
+  } catch (e) {
+    // e.g. ~/.claude is a file, or a folder isn't writable.
+    env.out(`groklink install --skill: couldn't install the skill: ${(e as Error).message}`);
+    return 1;
+  }
+}
+
+function copySkill(env: InstallEnv, opts: { force?: boolean; dryRun?: boolean }): number {
+  const src = env.skillSource;
+  if (!src || !existsSync(src)) {
+    env.out("Couldn't find the packaged skill (skills/groklink/SKILL.md). Reinstall groklink.");
+    return 1;
+  }
+  const dest = join(env.home, ".claude", SKILL);
+  const text = readFileSync(src, "utf8");
+  if (existsSync(dest)) {
+    if (readFileSync(dest, "utf8") === text) {
+      env.out(`The Grok Link skill is already installed at ${dest}.`);
+      return 0;
+    }
+    if (!opts.force) {
+      env.out(
+        `Skipped: ${dest} already exists and differs from this version's skill. Run \`groklink install --skill --force\` to replace it.`,
+      );
+      return 0;
+    }
+  }
+  if (opts.dryRun) {
+    env.out(`Dry run; nothing was written. groklink install --skill would write ${dest}.`);
+    return 0;
+  }
+  mkdirSync(dirname(dest), { recursive: true });
+  writeFileSync(dest, text);
+  env.out(`Installed the Grok Link skill at ${dest}. New Claude Code sessions will load it.`);
+  return 0;
+}
+
+const SKILL_HINT = "Tip: run `groklink install --skill` to add the Grok Link skill for Claude Code (~/.claude/skills/groklink/).";
 
 // ---- client configs ----
 
@@ -379,6 +438,7 @@ export async function install(env: InstallEnv, opts: Options = {}): Promise<numb
     env.out(`Registered the groklink MCP server in: ${register.map((s) => s.client).join(", ")}.`);
     env.out("Restart those apps to load it.");
   } else env.out("No new MCP client registrations were needed.");
+  env.out(SKILL_HINT);
   return 0;
 }
 

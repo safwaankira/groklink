@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.3
+
+- **Deep health.** `groklink_health` takes `deep: true` to make a real, read-only round trip through Grok Bot. It returns a `probe` with one result per check: `app`, `account` (signed in / signed out / unknown), `roster`, `transcript`, `usage` and `awake`. Each check is capped at 10 s. Failed checks add plain-English lines to `warnings`, e.g. "Grok Bot is signed out — open the app and sign in". Plain health is unchanged.
+- **`groklink doctor`.** Prints one line per check, then `PASS` or `FAIL: <check>`, with exit code 0 or 1. `--send <bot>` also runs one real "pong" task (uses one Grok message), and `--json` prints the raw result. Without `--send`, nothing is sent.
+- **Agent skill.** `skills/groklink/SKILL.md` ships in the package, and `groklink install --skill` copies it to `~/.claude/skills/groklink/`. It keeps an edited copy unless `--force` is given.
+
 ## 0.1.2
 
 - Routines get the safety policy: a new routine's name and prompt, and the name and stored prompt of a routine being enabled or run, are checked; blocked → `blocked_by_policy`, nothing sent.

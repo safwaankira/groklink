@@ -149,8 +149,13 @@ export const TOOLS = [
   {
     name: "groklink_health",
     method: "health",
-    description: "Report whether the Grok Link daemon is up and connected, its transport mode, the Grok Bot app version and uptime.",
-    inputSchema: noArgs,
+    description:
+      "Call first. Reports whether the Grok Link daemon is up and connected, its transport mode, the Grok Bot app version, Grok usage and warnings. deep:true also checks a real round trip (app, sign-in, Bot list, a transcript, usage, Bot computer awake) and adds a probe with one result per check; don't send tasks while a check fails.",
+    inputSchema: {
+      type: "object",
+      properties: { deep: { type: "boolean", description: "Also run the live checks (a few seconds; sends nothing). Default false." } },
+      additionalProperties: false,
+    },
   },
 ] satisfies { name: string; method: Method; description: string; inputSchema: object }[];
 

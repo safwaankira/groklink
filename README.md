@@ -36,6 +36,32 @@ Quit Claude Desktop before running `groklink install`, then reopen it. Restart t
 
 If you use [grokbot-bridge](https://github.com/TheSethRose/grokbot-bridge), install stops and tells you where it's registered: the two can't share the app, because each relaunches it in its own mode. `groklink install --replace-grokbot-bridge` removes those entries (with backups) and installs Grok Link.
 
+Grok Link is local: it runs on the Mac with Grok Bot. Remote agents reach it through that Mac (e.g. the Claude desktop app).
+
+### Check it works
+
+```bash
+groklink doctor
+```
+
+Runs a live, read-only check of the whole path and prints one line per check, then `PASS` or `FAIL: <check>` (exit 0 or 1):
+- `app`: the Grok Bot window is loaded.
+- `account`: signed in.
+- `roster`: at least one Bot.
+- `transcript`: a conversation can be read; no message text is printed.
+- `usage`: Grok usage isn't used up. If it is, the line says when it resets.
+- `awake`: the Bot's computer isn't asleep. This one is a warning (`!`), not a failure.
+
+Nothing is sent. `groklink doctor --send <bot>` also gives that Bot the task "Reply with only the word: pong" and passes only if it replies within 120 s. This uses one Grok message. `--json` prints the raw result. Agents get the same checks from `groklink_health` with `deep: true`.
+
+### Agent skill
+
+```bash
+groklink install --skill
+```
+
+Copies the Grok Link skill to `~/.claude/skills/groklink/SKILL.md`. The skill tells Claude Code how to use the tools: check health first, poll jobs, what each status means, and the safety rules. It adds only the skill; run plain `groklink install` for the daemon and MCP setup. If you've edited your copy, it's kept; `--force` replaces it.
+
 ## Tools
 
 | Tool | Purpose |
@@ -50,7 +76,7 @@ If you use [grokbot-bridge](https://github.com/TheSethRose/grokbot-bridge), inst
 | `groklink_download` | `{ bot, keys?, out_dir? }` → save files the Bot sent (default `~/.groklink/downloads/<bot>/`; see Security model for where `out_dir` may point) |
 | `groklink_usage` | Your weekly Grok Bot usage |
 | `groklink_routines` | List, add, run, enable, disable or remove a Bot's routines (`remove` needs `confirm`) |
-| `groklink_health` | Daemon up, transport mode, app version, self-test result |
+| `groklink_health` | `{ deep? }` → daemon up, transport mode, app version, self-test, usage, warnings; `deep: true` adds a live `probe` (see Check it works) |
 
 The same calls work from the shell:
 

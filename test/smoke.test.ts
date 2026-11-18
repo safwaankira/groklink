@@ -2,6 +2,6 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { VERSION } from "../src/shared/version.ts";
 
-test("VERSION is 0.1.2", () => {
-  assert.equal(VERSION, "0.1.2");
+test("VERSION is 0.1.3", () => {
+  assert.equal(VERSION, "0.1.3");
 });

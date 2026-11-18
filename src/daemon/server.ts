@@ -11,6 +11,7 @@ import { changeRoutine, listRoutines, type Routine, type RoutineChange, runRouti
 import { type HealthResult, ProtocolError, type Response, type TransportMode } from "../shared/protocol.ts";
 import type { EventLog } from "./events.ts";
 import { JOB_STATUSES, type JobStatus, type Jobs, type UsageSummary } from "./jobs.ts";
+import { deepProbe, type ProbeResult, probeWarnings } from "./probe.ts";
 import type { SelfTestResult } from "./selftest.ts";
 import { type Log, statePaths } from "./state.ts";
 
@@ -105,6 +106,14 @@ async function routines(cdp: CDP, p: Record<string, unknown>, policy: (text: str
   return changeRoutine(cdp, str("bot"), action as RoutineChange, str("routine"), timing);
 }
 
+type Health = HealthResult & {
+  selftest: SelfTestResult | null;
+  usage: UsageSummary | null;
+  policy: Record<string, boolean> | null;
+  warnings: string[];
+  probe?: ProbeResult;
+};
+
 /** What the methods need from the self-test. */
 export type SelfTestState = { result: SelfTestResult | null; failure(): string | null };
 
@@ -119,22 +128,25 @@ export function daemonMethods(
     return v;
   };
   return {
-    health: (): HealthResult & {
-      selftest: SelfTestResult | null;
-      usage: UsageSummary | null;
-      policy: Record<string, boolean> | null;
-      warnings: string[];
-    } => ({
-      ok: true,
-      mode: link.mode,
-      connected: link.connected,
-      appVersion: link.appVersion,
-      uptimeSec: Math.floor((Date.now() - startedAt) / 1000),
-      selftest: opts.selftest?.result ?? null,
-      usage: opts.jobs?.usageSnapshot() ?? null,
-      policy: opts.jobs?.policyState().rules ?? null,
-      warnings: [...(link.mode === "port0" ? [PORT0_WARNING] : []), ...(opts.jobs?.policyState().warnings ?? [])],
-    }),
+    // Plain health answers from what the daemon already knows; `deep` also makes a real round trip through Grok Bot.
+    health: (p) => {
+      const plain = (): Health => ({
+        ok: true,
+        mode: link.mode,
+        connected: link.connected,
+        appVersion: link.appVersion,
+        uptimeSec: Math.floor((Date.now() - startedAt) / 1000),
+        selftest: opts.selftest?.result ?? null,
+        usage: opts.jobs?.usageSnapshot() ?? null,
+        policy: opts.jobs?.policyState().rules ?? null,
+        warnings: [...(link.mode === "port0" ? [PORT0_WARNING] : []), ...(opts.jobs?.policyState().warnings ?? [])],
+      });
+      if (!reader(p).optBool("deep")) return plain();
+      return deepProbe(cdp).then((probe) => {
+        const h = plain();
+        return { ...h, probe, warnings: [...h.warnings, ...probeWarnings(probe)] };
+      });
+    },
     // A Bot's preview and description can carry text the Bot wrote.
     bots: async () => (await listBots(cdp())).map((b) => ({ ...b, untrusted: true })),
     task: (p) => {

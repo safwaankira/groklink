@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Method } from "../shared/protocol.ts";
 import { VERSION } from "../shared/version.ts";
-import { defaultEnv, install, uninstall } from "./install.ts";
+import { defaultEnv, install, installSkill, uninstall } from "./install.ts";
 import { serveMcp } from "./mcp.ts";
 import { call } from "./socket.ts";
 
@@ -12,7 +12,9 @@ const USAGE = `groklink ${VERSION}
 
 Usage:
   groklink mcp                                   Run the MCP server on stdio
-  groklink health                                Daemon and app status
+  groklink health [--deep]                       Daemon and app status (--deep: live checks through Grok Bot)
+  groklink doctor [--send <bot>] [--json]        Check the whole path, one line per check; exit 0 = PASS
+                                                 --send also gives <bot> a one-line test task (uses one Grok message)
   groklink bots                                  List Bots
   groklink task <bot> <brief…> [--schema file.json] [--file path]…
   groklink job <jobId> [--wait N]                Show a job, waiting up to N seconds (max 120)
@@ -20,6 +22,7 @@ Usage:
   groklink events [--since N]                    Events after seq N
   groklink install [--dry-run] [--replace-grokbot-bridge]
                                                  Run the daemon at login and register the MCP server in your clients
+  groklink install --skill [--force] [--dry-run] Add the agent skill to ~/.claude/skills/groklink/ (only that)
   groklink uninstall [--dry-run]                 Undo install (keeps the state folder)`;
 
 class UsageError extends Error {}
@@ -52,7 +55,14 @@ function num(flag: string, v: string | undefined): number | undefined {
 
 function request(cmd: string, args: string[]): [Method, Record<string, unknown>] {
   switch (cmd) {
-    case "health":
+    case "health": {
+      const deep = args.includes("--deep");
+      parse(
+        args.filter((a) => a !== "--deep"),
+        [],
+      );
+      return ["health", deep ? { deep: true } : {}];
+    }
     case "bots":
     case "jobs":
       parse(args, []);
@@ -86,6 +96,106 @@ function request(cmd: string, args: string[]): [Method, Record<string, unknown>]
   }
 }
 
+// ---- doctor ----
+
+type Check = { name: string; ok: boolean; warn?: boolean; ms?: number; detail: string };
+const SEND_BRIEF = "Reply with only the word: pong";
+const SEND_WAIT_MS = 120_000;
+
+const line = (c: Check) => `${c.ok ? (c.warn ? "!" : "✓") : "✗"} ${c.name.padEnd(10)} ${c.detail}`;
+
+/** `--send <bot>`: one real task, passed only if a Bot reply within 120 s contains "pong". */
+async function sendCheck(bot: string): Promise<Check & { jobId?: string }> {
+  const started = Date.now();
+  let jobId: string | undefined;
+  try {
+    ({ jobId } = (await call("task", { bot, brief: SEND_BRIEF })) as { jobId: string });
+    type Job = { status: string; messages?: { role: string; text: string }[]; error?: { code: string; message: string } | null };
+    let job: Job = { status: "queued" };
+    while (Date.now() - started < SEND_WAIT_MS) {
+      const wait = Math.max(1, Math.min(120, Math.ceil((SEND_WAIT_MS - (Date.now() - started)) / 1000)));
+      job = (await call("job", { jobId, wait_seconds: wait })) as Job;
+      if (job.status !== "queued" && job.status !== "working") break;
+    }
+    const ms = Date.now() - started;
+    const replied = (job.messages ?? []).some((m) => m.role !== "user" && /pong/i.test(m.text));
+    if (job.status === "done" && replied)
+      return { name: "send", ok: true, ms, detail: `${bot} replied pong (${Math.round(ms / 1000)} s)`, jobId };
+    const why = job.error
+      ? `${job.error.code}: ${job.error.message.split("\n")[0]}`
+      : job.status === "done"
+        ? "the reply had no pong"
+        : job.status === "needs_input"
+          ? "the Bot is waiting for input in Grok Bot (needs_input)"
+          : job.status === "queued" || job.status === "working"
+            ? `still ${job.status} after 120 s`
+            : `the job ended ${job.status}`;
+    return { name: "send", ok: false, ms, detail: `${bot}: ${why} (job ${jobId})`, jobId };
+  } catch (e) {
+    const { code = "internal", message } = e as { code?: string; message: string };
+    return {
+      name: "send",
+      ok: false,
+      ms: Date.now() - started,
+      detail: `${code}: ${String(message).split("\n")[0]}`,
+      ...(jobId ? { jobId } : {}),
+    };
+  }
+}
+
+/** `groklink doctor`: deep health, one line per check, then PASS or FAIL: <first failed check>. Returns the exit code. */
+async function doctor(args: string[]): Promise<number> {
+  const json = args.includes("--json");
+  const { pos, opts } = parse(
+    args.filter((a) => a !== "--json"),
+    ["send"],
+  );
+  if (pos.length) throw new UsageError("doctor takes no arguments besides --send <bot> and --json.");
+  const bot = opts.send?.[0];
+  if (bot !== undefined && !bot.trim()) throw new UsageError("--send needs a Bot name.");
+  const say = (s: string) => {
+    if (!json) console.log(s);
+  };
+
+  type DeepHealth = { probe?: { ok: boolean; checks: Check[] }; warnings?: string[]; [k: string]: unknown };
+  let health: DeepHealth | null = null;
+  let checks: Check[];
+  try {
+    const h = (await call("health", { deep: true })) as DeepHealth;
+    health = h;
+    checks = h.probe?.checks ?? [
+      {
+        name: "daemon",
+        ok: false,
+        detail:
+          "the running daemon is older than this CLI and has no deep health: update groklink, then restart the daemon (launchctl kickstart -k gui/$(id -u)/dev.groklink.daemon)",
+      },
+    ];
+  } catch (e) {
+    const { code = "internal", message } = e as { code?: string; message: string };
+    checks = [{ name: "daemon", ok: false, detail: `${code}: ${String(message).split("\n")[0]}` }];
+  }
+  for (const c of checks) say(line(c));
+
+  let send: (Check & { jobId?: string }) | undefined;
+  if (bot !== undefined) {
+    if (checks.every((c) => c.ok)) {
+      say(`Sending one test task to ${bot} ("${SEND_BRIEF}"); this uses one Grok message.`);
+      send = await sendCheck(bot);
+    } else send = { name: "send", ok: false, detail: "skipped: fix the failed check first (nothing was sent)" };
+    checks = [...checks, send];
+    say(line(send));
+  }
+
+  const failed = checks.find((c) => !c.ok);
+  if (json) console.log(JSON.stringify({ ...health, checks, ...(send ? { send } : {}), pass: !failed }, null, 2));
+  else {
+    for (const w of (health as DeepHealth | null)?.warnings ?? []) say(`  ${w}`);
+    say(failed ? `FAIL: ${failed.name}` : "PASS");
+  }
+  return failed ? 1 : 0;
+}
+
 const [cmd = "", ...args] = process.argv.slice(2);
 if (cmd === "mcp") {
   serveMcp();
@@ -93,6 +203,24 @@ if (cmd === "mcp") {
   console.log(VERSION);
 } else if (cmd === "--help" || cmd === "-h" || cmd === "help") {
   console.log(USAGE);
+} else if (cmd === "doctor") {
+  try {
+    process.exit(await doctor(args));
+  } catch (e) {
+    if (e instanceof UsageError) {
+      console.error(`${e.message}\n\n${USAGE}`);
+      process.exit(2);
+    }
+    console.error(`groklink doctor: ${(e as Error).message}`);
+    process.exit(1);
+  }
+} else if (cmd === "install" && args.includes("--skill")) {
+  const bad = args.find((a) => !["--skill", "--force", "--dry-run"].includes(a));
+  if (bad !== undefined) {
+    console.error(`Unknown option ${bad} (with --skill, only --force and --dry-run).\n\n${USAGE}`);
+    process.exit(2);
+  }
+  process.exit(installSkill(defaultEnv(), { force: args.includes("--force"), dryRun: args.includes("--dry-run") }));
 } else if (cmd === "install" || cmd === "uninstall") {
   const allowed = cmd === "install" ? ["--dry-run", "--replace-grokbot-bridge"] : ["--dry-run"];
   const bad = args.find((a) => !allowed.includes(a));
