@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.4
+
+- **Usage gate after a reset.** A cached "used up" reading is no longer reused once its reset time has passed, and `groklink_task` re-reads usage once before refusing with `usage_exhausted`. Before, a task sent just after the weekly reset could still be refused for up to a minute. If the re-read fails, the last reading still applies.
+- **`groklink doctor --send`.** It passes as soon as the Bot's reply contains "pong", even if the Bot keeps working on other tasks afterwards; the line then says so. It checks every 15 s at most and never stops the job.
+
 ## 0.1.3
 
 - **Deep health.** `groklink_health` takes `deep: true` to make a real, read-only round trip through Grok Bot. It returns a `probe` with one result per check: `app`, `account` (signed in / signed out / unknown), `roster`, `transcript`, `usage` and `awake`. Each check is capped at 10 s. Failed checks add plain-English lines to `warnings`, e.g. "Grok Bot is signed out — open the app and sign in". Plain health is unchanged.

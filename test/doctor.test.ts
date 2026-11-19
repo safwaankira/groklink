@@ -272,3 +272,43 @@ test("install --skill via the CLI: a filesystem error exits 1 with a one-line me
   assert.match(r.stdout, /couldn't install the skill/);
   assert.doesNotMatch(r.stderr, /at .*\.js:\d+/);
 });
+
+// ---- T16 ----
+
+test("doctor --send: passes on a job still working whose messages contain pong, and notes the Bot kept working", async () => {
+  const d = await daemon(HEALTHY, "PONG", "working");
+  const started = Date.now();
+  const r = await doctor(d.home, "--send", "Alpha");
+  assert.equal(r.code, 0);
+  assert.match(r.out, /^✓ send\s+Alpha replied pong \(\d+ s\) \(the Bot kept working on other tasks after replying\)$/m);
+  assert.match(r.out.trim(), /PASS$/);
+  assert.ok(Date.now() - started < 30_000, "passes as soon as pong is seen");
+  assert.equal(d.sent.length, 1);
+});
+
+test("doctor --send: polls job with wait_seconds of at most 15", async () => {
+  const d = await daemon(HEALTHY, "PONG", "done");
+  const waits: unknown[] = [];
+  server?.close();
+  const paths = statePaths(d.home);
+  const { token } = ensureState(paths);
+  let polls = 0;
+  server = await startServer({
+    socketPath: paths.socket,
+    token,
+    methods: {
+      health: () => ({ ok: true, probe: { ok: true, checks: HEALTHY } }),
+      task: () => ({ jobId: "j_000000000001", status: "queued" }),
+      job: (p) => {
+        waits.push(p.wait_seconds);
+        const done = ++polls >= 2;
+        return { jobId: "j_000000000001", status: "working", messages: done ? [{ role: "assistant", text: "pong" }] : [] };
+      },
+    },
+    log: () => {},
+  });
+  const r = await doctor(d.home, "--send", "Alpha");
+  assert.equal(r.code, 0);
+  assert.equal(waits.length, 2);
+  for (const w of waits) assert.ok(typeof w === "number" && w >= 1 && w <= 15, String(w));
+});

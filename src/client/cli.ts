@@ -101,10 +101,15 @@ function request(cmd: string, args: string[]): [Method, Record<string, unknown>]
 type Check = { name: string; ok: boolean; warn?: boolean; ms?: number; detail: string };
 const SEND_BRIEF = "Reply with only the word: pong";
 const SEND_WAIT_MS = 120_000;
+/** Longest single `job` wait while polling, so a reply is noticed quickly. */
+const SEND_POLL_S = 15;
 
 const line = (c: Check) => `${c.ok ? (c.warn ? "!" : "✓") : "✗"} ${c.name.padEnd(10)} ${c.detail}`;
 
-/** `--send <bot>`: one real task, passed only if a Bot reply within 120 s contains "pong". */
+/**
+ * `--send <bot>`: one real task, passed as soon as a Bot reply in the job contains "pong", whatever the job's status
+ * (a Bot can reply and then carry on with older work). Polls every 15 s at most, for up to 120 s. Never stops the job.
+ */
 async function sendCheck(bot: string): Promise<Check & { jobId?: string }> {
   const started = Date.now();
   let jobId: string | undefined;
@@ -112,15 +117,17 @@ async function sendCheck(bot: string): Promise<Check & { jobId?: string }> {
     ({ jobId } = (await call("task", { bot, brief: SEND_BRIEF })) as { jobId: string });
     type Job = { status: string; messages?: { role: string; text: string }[]; error?: { code: string; message: string } | null };
     let job: Job = { status: "queued" };
+    const replied = () => (job.messages ?? []).some((m) => m.role !== "user" && /pong/i.test(m.text));
     while (Date.now() - started < SEND_WAIT_MS) {
-      const wait = Math.max(1, Math.min(120, Math.ceil((SEND_WAIT_MS - (Date.now() - started)) / 1000)));
+      const wait = Math.max(1, Math.min(SEND_POLL_S, Math.ceil((SEND_WAIT_MS - (Date.now() - started)) / 1000)));
       job = (await call("job", { jobId, wait_seconds: wait })) as Job;
-      if (job.status !== "queued" && job.status !== "working") break;
+      if (replied() || (job.status !== "queued" && job.status !== "working")) break;
     }
     const ms = Date.now() - started;
-    const replied = (job.messages ?? []).some((m) => m.role !== "user" && /pong/i.test(m.text));
-    if (job.status === "done" && replied)
-      return { name: "send", ok: true, ms, detail: `${bot} replied pong (${Math.round(ms / 1000)} s)`, jobId };
+    if (replied()) {
+      const still = job.status === "working" ? " (the Bot kept working on other tasks after replying)" : "";
+      return { name: "send", ok: true, ms, detail: `${bot} replied pong (${Math.round(ms / 1000)} s)${still}`, jobId };
+    }
     const why = job.error
       ? `${job.error.code}: ${job.error.message.split("\n")[0]}`
       : job.status === "done"

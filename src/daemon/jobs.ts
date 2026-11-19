@@ -434,7 +434,9 @@ export class Jobs {
     if (schema !== null && (typeof schema !== "object" || Array.isArray(schema)))
       throw new ProtocolError("bad_request", '"schema" must be a JSON Schema object.');
     this.enforce(wrapBrief(brief, schema));
-    const u = await this.readUsage();
+    let u = await this.readUsage();
+    // A cached "out" can be up to usageCacheMs old: confirm with one fresh read before refusing.
+    if (u && usageOut(u)) u = await this.readUsage({ fresh: true });
     if (u && usageOut(u)) throw new ProtocolError("usage_exhausted", usageMessage(u, "Nothing was sent."));
     const files = params.files ?? [];
     const relative = files.find((f) => !isAbsolute(f));
@@ -703,16 +705,27 @@ export class Jobs {
     return u ? { percentUsed: u.percentUsed, resetsAt: u.resetsAt, out: usageOut(u) } : null;
   }
 
-  /** Current usage, reused for `usageCacheMs`; null (logged, never thrown) if it can't be read. */
-  private async readUsage(): Promise<Usage | null> {
+  /**
+   * Current usage, reused for `usageCacheMs`, except a cached "out" reading whose reset time has passed. `fresh`
+   * always reads again and, if that read fails, falls back to the cached reading. Null (logged, never thrown) if it
+   * can't be read and there's nothing to fall back to.
+   */
+  private async readUsage(opts: { fresh?: boolean } = {}): Promise<Usage | null> {
     if (!this.o.layer.usage) return null;
     const now = this.o.clock();
-    if (this.usageCache && now - this.usageCache.at < this.o.usageCacheMs) return this.usageCache.value;
+    const cached = this.usageCache;
+    const resetPassed = (u: Usage) => u.resetsAt !== null && Date.parse(u.resetsAt) <= now;
+    if (!opts.fresh && cached && now - cached.at < this.o.usageCacheMs && !(usageOut(cached.value) && resetPassed(cached.value)))
+      return cached.value;
     try {
       const value = await this.o.layer.usage();
       this.usageCache = { at: now, value };
       return value;
     } catch {
+      if (opts.fresh && cached) {
+        this.o.log("couldn't re-read Grok usage; using the last reading");
+        return cached.value;
+      }
       this.o.log("couldn't read Grok usage; not blocking");
       return null;
     }

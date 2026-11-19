@@ -453,6 +453,73 @@ test("an idle with no reply checks usage at once: out → failed with usage_exha
   assert.equal(fake.waits.length, 1);
 });
 
+// ---- T16: a stale "out" usage reading ----
+
+const RESET = Date.parse("2026-11-20T00:00:00.000Z");
+
+/** Usage answers from `answers` in turn (the last repeats), counting calls; the start-up read is awaited. */
+async function usageSequence(answers: (Usage | Error)[], now: { t: number }) {
+  let calls = 0;
+  fake.layer.usage = async () => {
+    const a = answers[Math.min(calls++, answers.length - 1)];
+    if (a instanceof Error) throw a;
+    return a;
+  };
+  const j = jobs({ clock: () => now.t });
+  await until(() => calls >= 1);
+  await sleep(5);
+  return { j, calls: () => calls };
+}
+
+test('usage cache: an "out" reading past its reset time isn\'t reused; create goes through', async () => {
+  const now = { t: RESET - 10_000 };
+  const u = await usageSequence([usageAt(100), usageAt(0)], now);
+  assert.equal(u.j.usageSnapshot()?.out, true);
+  now.t = RESET + 1_000; // 11 s later: still inside the 60 s cache window, but the reset has passed
+  assert.deepEqual(await u.j.usageSummary(), { percentUsed: 0, resetsAt: "2026-11-20T00:00:00.000Z", out: false });
+  assert.equal(u.calls(), 2, "read fresh instead of reusing the stale out reading");
+  await u.j.create({ bot: "Alpha", brief: "Reply with the word pong and nothing else." });
+  await until(() => fake.sent.length === 1);
+});
+
+test("usage cache: a stale out cache past reset goes straight to a fresh read on create", async () => {
+  const now = { t: RESET - 10_000 };
+  const u = await usageSequence([usageAt(100), usageAt(0)], now);
+  now.t = RESET;
+  await u.j.create({ bot: "Alpha", brief: "Reply with the word pong and nothing else." });
+  assert.equal(u.calls(), 2);
+  await until(() => fake.sent.length === 1);
+});
+
+test("usage cache: a cached out before its reset time triggers exactly one fresh read before blocking", async () => {
+  const now = { t: RESET - 60 * 60_000 };
+  const u = await usageSequence([usageAt(100)], now);
+  assert.equal(u.calls(), 1);
+  await assert.rejects(u.j.create({ bot: "Alpha", brief: "Reply with the word pong and nothing else." }), { code: "usage_exhausted" });
+  assert.equal(u.calls(), 2, "one fresh usage() call, then blocked");
+  await sleep(30);
+  assert.deepEqual(fake.sent, []);
+});
+
+test("usage cache: a fresh read that is still out blocks; a fresh read that is no longer out lets the task through", async () => {
+  const now = { t: RESET - 60 * 60_000 };
+  const out = await usageSequence([usageAt(100), usageAt(100)], now);
+  await assert.rejects(out.j.create({ bot: "Alpha", brief: "Reply with the word pong and nothing else." }), { code: "usage_exhausted" });
+  assert.deepEqual(fake.sent, []);
+  const back = await usageSequence([usageAt(100), usageAt(0)], now);
+  await back.j.create({ bot: "Alpha", brief: "Reply with the word pong and nothing else." });
+  assert.equal(back.calls(), 2);
+  await until(() => fake.sent.length === 1);
+});
+
+test("usage cache: if the fresh read fails, the cached out reading still blocks", async () => {
+  const now = { t: RESET - 60 * 60_000 };
+  const u = await usageSequence([usageAt(100), new Error("Couldn't read usage from Grok Bot: 503")], now);
+  await assert.rejects(u.j.create({ bot: "Alpha", brief: "Reply with the word pong and nothing else." }), { code: "usage_exhausted" });
+  assert.equal(u.calls(), 2);
+  assert.deepEqual(fake.sent, []);
+});
+
 test("health shows usage: percent, reset time and out (null until it has been read)", async () => {
   fake.layer.usage = async () => usageAt(100);
   const link = { connected: false };
