@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.5
+
+- **Posting to X has three modes.** `x_write` in `policy.json` is `block` (default, as before), `approve` or `allow`. Old files keep working: `true` is `block`, `false` is `allow`, and an unknown value is `block` with a warning.
+- **`approve` mode.** A task that would post to X starts as `needs_approval` and nothing is sent until you click **Approve and send** in a macOS dialog showing the Bot and the whole brief. **Deny** fails the task with `approval_denied`, and no answer within 10 minutes with `approval_timeout`. Approve mode accepts plain text only: every character of a posting brief must be printable ASCII, a newline or an emoji, with at most 40 lines, no more than 2 blank lines in a row and at most 1,500 characters; anything else is `blocked_by_policy`. The dialog shows the brief exactly as it's sent, and a task that needs approval can't have attachments or a schema (a posting request in an attachment or schema is blocked too). At most 5 tasks wait for approval at once; more fail with `approval_queue_full`. If the dialog can't be shown, the task fails with `approval_error`. After a daemon restart, held tasks follow the current mode. One dialog at a time; each decision goes to the event log (rule, decision, job id; no brief text). No tool, socket method or flag can approve a task, and the socket now refuses unknown parameters on `task`, `job` and `jobs`.
+- **`allow` mode.** Posting briefs pass, and `groklink_health` warns about it.
+- **`groklink policy`** shows each rule and mode. `groklink policy x_write <block|approve|allow>` rewrites `policy.json` (0600, atomic) and restarts the daemon. CLI only. It refuses to rewrite a `policy.json` it can't parse (prints the error, exits 1), so your other settings aren't lost, and writes through a symlinked `policy.json`.
+- `groklink_job` over MCP waits at most 50 s (`wait_seconds` maximum 50; larger values are clamped), to stay under MCP clients that time out a tool call after about a minute. `groklink job --wait` still allows 120.
+- `groklink_health` shows `policy.x_write` as the mode, and `groklink doctor` prints it (`!` when `allow`).
+
 ## 0.1.4
 
 - **Usage gate after a reset.** A cached "used up" reading is no longer reused once its reset time has passed, and `groklink_task` re-reads usage once before refusing with `usage_exhausted`. Before, a task sent just after the weekly reset could still be refused for up to a minute. If the re-read fails, the last reading still applies.

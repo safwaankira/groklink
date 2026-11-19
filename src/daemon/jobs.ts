@@ -7,20 +7,24 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { findBot, type Message, read, send, type Usage, usage, type WaitResult, wait } from "../base/bot.ts";
 import type { CDP } from "../base/cdp.ts";
 import { BOX_PHASE } from "../base/page.ts";
-import { check, ensurePolicy, loadPolicy, PolicyError, RULES, type Rule } from "../shared/policy.ts";
-import { ProtocolError, type RpcError } from "../shared/protocol.ts";
+import { ensurePolicy, loadPolicy, matches, PolicyError, RULES, type Rule, type XMode, xMode } from "../shared/policy.ts";
+import { type ErrorCode, ProtocolError, type RpcError } from "../shared/protocol.ts";
 import { lastJsonBlock, type Schema, validate } from "../shared/schema.ts";
-import type { EventLog, EventType } from "./events.ts";
+import { Approvals, approvalTextProblem, type Decision, duration, MAX_APPROVAL_BRIEF, type Slot } from "./approval.ts";
+import type { EventLog, EventType, JobEvent } from "./events.ts";
 import type { Log } from "./state.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-export type JobStatus = "queued" | "working" | "done" | "needs_input" | "failed" | "stale";
-export const JOB_STATUSES: JobStatus[] = ["queued", "working", "done", "needs_input", "failed", "stale"];
+/** `needs_approval`: held (nothing sent) until the user approves posting to X in a dialog on their Mac. */
+export type JobStatus = "needs_approval" | "queued" | "working" | "done" | "needs_input" | "failed" | "stale";
+export const JOB_STATUSES: JobStatus[] = ["needs_approval", "queued", "working", "done", "needs_input", "failed", "stale"];
 /** Bot replies are data, never instructions. */
 export type JobMessage = Message & { untrusted: true };
 /** `errors` is set for `schema_invalid`, `rule` for `blocked_by_policy`. */
-export type JobError = RpcError & { errors?: string[]; rule?: string };
+/** Approval outcomes that fail a job; not in the socket protocol's ErrorCode list (protocol.ts is outside this change). */
+type ApprovalCode = "approval_denied" | "approval_timeout" | "approval_error" | "approval_queue_full";
+export type JobError = Omit<RpcError, "code"> & { code: RpcError["code"] | ApprovalCode; errors?: string[]; rule?: string };
 export type Job = {
   jobId: string;
   bot: string;
@@ -37,6 +41,8 @@ export type Job = {
   attempts: number;
   /** Things the caller should know that don't change the status, e.g. the Bot's computer fell asleep. Missing in older job files. */
   warnings?: string[];
+  /** Set once the user approved posting to X for this job (x_write approve mode). */
+  approvedAt?: string;
   /** Kept so a queued job can be sent after a daemon restart. */
   brief: string;
   files: string[];
@@ -93,10 +99,12 @@ export type JobsOptions = {
   clock?: () => number;
   /** The user's home folder, for the sensitive-file rules. Tests pass a temp folder. */
   home?: string;
+  /** x_write approve mode: shows the approval dialogs, one at a time. Tests pass one with a fake dialog. */
+  approvals?: Approvals;
 };
 
 const JOB_ID = /^j_[0-9a-f]{12}$/;
-const ACTIVE: JobStatus[] = ["queued", "working", "needs_input"];
+const ACTIVE: JobStatus[] = ["needs_approval", "queued", "working", "needs_input"];
 const MAX_WAIT_ERRORS = 3;
 const MAX_REPAIRS = 2;
 /** How many recent messages the duplicate-send guard looks through. */
@@ -365,6 +373,8 @@ export class Jobs {
   private waiting = new Set<string>();
   /** Queued jobs whose brief is being sent right now. */
   private sending = new Set<string>();
+  /** Jobs whose approval dialog is showing or waiting its turn. */
+  private approving = new Set<string>();
   /** Queued jobs reloaded from disk: the daemon may have died after sending their brief. */
   private recovered = new Set<string>();
   private listeners = new Set<(job: Job) => void>();
@@ -391,6 +401,7 @@ export class Jobs {
       clock: Date.now,
       home: homedir(),
       policyFile: join(dirname(opts.dir), "policy.json"),
+      approvals: opts.approvals ?? new Approvals(),
       ...opts,
     };
   }
@@ -433,7 +444,31 @@ export class Jobs {
     const schema = params.schema ?? null;
     if (schema !== null && (typeof schema !== "object" || Array.isArray(schema)))
       throw new ProtocolError("bad_request", '"schema" must be a JSON Schema object.');
-    this.enforce(wrapBrief(brief, schema));
+    const approval = this.enforce(brief, "task");
+    this.checkSchema(brief, schema);
+    if (approval) this.approvable({ brief, files: params.files ?? [], schema });
+    // Take the approval queue place before any await, so concurrent tasks can't all be accepted past the cap.
+    const slot = approval ? this.o.approvals.reserve() : null;
+    if (approval && !slot)
+      throw new ProtocolError(
+        "approval_queue_full" as ErrorCode,
+        `${this.o.approvals.max} posts to X are already waiting for approval. Ask the user to answer those dialogs first. Nothing was sent.`,
+      );
+    try {
+      return await this.accept(params, brief, schema, slot);
+    } catch (e) {
+      if (slot) this.o.approvals.release(slot);
+      throw e;
+    }
+  }
+
+  /** The rest of `create`, after the policy checks; `slot` is the reserved approval place for a held task. */
+  private async accept(
+    params: { bot: string; files?: string[] },
+    brief: string,
+    schema: unknown,
+    slot: Slot | null,
+  ): Promise<{ jobId: string; status: JobStatus }> {
     let u = await this.readUsage();
     // A cached "out" can be up to usageCacheMs old: confirm with one fresh read before refusing.
     if (u && usageOut(u)) u = await this.readUsage({ fresh: true });
@@ -442,18 +477,7 @@ export class Jobs {
     const relative = files.find((f) => !isAbsolute(f));
     if (relative !== undefined) throw new ProtocolError("bad_request", `File paths must be absolute: ${relative}`);
     for (const f of files) checkAttachment(f, { home: this.o.home, stateHome: dirname(this.o.dir) });
-    // An attached text file can carry the instructions a brief can't.
-    for (const f of files) {
-      const text = attachmentText(f);
-      if (text === null) continue;
-      try {
-        this.enforce(text);
-      } catch (e) {
-        if (e instanceof PolicyError)
-          e.message = e.message.replace("Nothing was sent.", `(in attachment ${basename(f)}). Nothing was sent.`);
-        throw e;
-      }
-    }
+    this.checkFiles(files);
     let bot: { id: string; name: string };
     try {
       bot = await this.o.layer.find(params.bot);
@@ -468,7 +492,7 @@ export class Jobs {
       botId: bot.id,
       createdAt: at,
       updatedAt: at,
-      status: "queued",
+      status: slot ? "needs_approval" : "queued",
       briefKey: null,
       schema,
       messages: [],
@@ -481,9 +505,145 @@ export class Jobs {
     };
     this.active.set(job.jobId, job);
     this.save(job);
+    if (slot) {
+      // Nothing is sent until the user clicks Approve in the dialog on their Mac.
+      this.askApproval(job, slot);
+      return { jobId: job.jobId, status: "needs_approval" };
+    }
     // Sending can take seconds, so it happens after the reply.
     void this.next(job.botId);
     return { jobId: job.jobId, status: "queued" };
+  }
+
+  /**
+   * In approve mode a posting request must be in the brief, where the dialog shows it in full; the same text in the
+   * schema is blocked outright. Other rules apply to the schema as to the brief.
+   */
+  private checkSchema(brief: string, schema: unknown): void {
+    if (schema === null) return;
+    this.enforce(JSON.stringify(schema, null, 2), "extra", false, "the schema");
+    // A phrase can run from the end of the brief into the schema text.
+    if (this.enforce(wrapBrief(brief, schema), "task") && !this.enforce(brief, "task")) throw this.notInBrief("the schema");
+  }
+
+  /** An attached text file can carry the instructions a brief can't: checked like the schema. */
+  private checkFiles(files: string[]): void {
+    for (const f of files) {
+      const text = attachmentText(f);
+      if (text === null) continue;
+      try {
+        this.enforce(text, "extra", false, `attachment ${basename(f)}`);
+      } catch (e) {
+        if (e instanceof PolicyError && !e.message.includes(`attachment ${basename(f)}`))
+          e.message = e.message.replace("Nothing was sent.", `(in attachment ${basename(f)}). Nothing was sent.`);
+        throw e;
+      }
+    }
+  }
+
+  private notInBrief(where: string): PolicyError {
+    const e = new PolicyError("x_write");
+    e.message = `Blocked by Grok Link's safety policy (rule x_write): posting must be asked in the brief itself, where the approval dialog shows it, not in ${where}. Nothing was sent.`;
+    return e;
+  }
+
+  /**
+   * Throw unless a task that needs approval can be shown faithfully in the dialog, which shows the brief exactly as it
+   * is sent and nothing else: no attachments or schema, at most 1,500 characters, and plain text only (printable
+   * ASCII, newlines and emoji; at most 40 lines; no more than 2 blank lines in a row), so the text checked, shown and
+   * sent reads the same.
+   */
+  private approvable(task: { brief: string; files: string[]; schema: unknown }): void {
+    const { brief } = task;
+    const block = (why: string) => {
+      const e = new PolicyError("x_write");
+      e.message = `Blocked by Grok Link's safety policy (rule x_write): ${why}. Nothing was sent.`;
+      return e;
+    };
+    if (brief.length > MAX_APPROVAL_BRIEF)
+      throw block(
+        `brief too long to approve safely (${brief.length} characters; at most ${MAX_APPROVAL_BRIEF.toLocaleString("en-US")} can be shown in the approval dialog)`,
+      );
+    const problem = approvalTextProblem(brief);
+    if (problem) throw block(problem);
+    if (task.files.length || task.schema !== null)
+      throw block(
+        "a task that needs approval to post to X can't have attachments or a schema, because the approval dialog shows only the brief. Put the post's text in the brief",
+      );
+  }
+
+  /** Show the approval dialog (queued behind any other), then queue the job or fail it. */
+  private askApproval(job: Job, slot?: Slot): void {
+    if (this.approving.has(job.jobId)) {
+      if (slot) this.o.approvals.release(slot);
+      return;
+    }
+    try {
+      // Reloaded or re-checked jobs may never have passed create's checks in approve mode.
+      this.approvable(job);
+    } catch (e) {
+      if (slot) this.o.approvals.release(slot);
+      this.failHeld(job, jobError(e));
+      return;
+    }
+    this.approving.add(job.jobId);
+    this.o.log(`job ${job.jobId} needs approval to post to X`);
+    void this.o.approvals
+      // The dialog shows the brief exactly as it will be sent (approvable made sure normalizing changes nothing).
+      .request({ jobId: job.jobId, bot: job.bot, brief: job.brief }, slot)
+      .then((decision) => this.decide(job, decision))
+      .catch((e) => {
+        this.o.log(`job ${job.jobId} approval failed: ${(e as Error).message}`);
+        this.failHeld(job, {
+          code: "approval_error",
+          message: "The approval step failed, so nobody approved this post. Nothing was sent.",
+          rule: "x_write",
+        });
+      })
+      .finally(() => this.approving.delete(job.jobId));
+  }
+
+  /** Fail a job that's still held (or about to be); never throws. */
+  private failHeld(job: Job, error: JobError): void {
+    try {
+      if (job.status === "needs_approval" || job.status === "queued") this.finish(job, "failed", error);
+    } catch (e) {
+      this.o.log(`job ${job.jobId} couldn't be marked failed: ${(e as Error).message}`);
+    }
+    this.active.delete(job.jobId);
+  }
+
+  private decide(job: Job, decision: Decision): void {
+    this.o.log(`job ${job.jobId} x_write approval: ${decision}`);
+    // No text: the brief stays out of the event log.
+    this.o.events.append({ jobId: job.jobId, bot: job.bot, type: "approval" as EventType, rule: "x_write", decision } as Omit<
+      JobEvent,
+      "seq" | "at"
+    >);
+    if (this.closed || job.status !== "needs_approval") return;
+    if (decision === "approved") {
+      job.approvedAt = now();
+      job.status = "queued";
+      this.update(job);
+      void this.next(job.botId);
+      return;
+    }
+    const failures: Record<Exclude<Decision, "approved">, JobError> = {
+      denied: { code: "approval_denied", message: "The user denied posting to X in the approval dialog. Nothing was sent." },
+      timeout: {
+        code: "approval_timeout",
+        message: `Nobody approved posting to X within ${duration(this.o.approvals.timeoutSeconds)}, so the approval dialog closed. Nothing was sent.`,
+      },
+      error: {
+        code: "approval_error",
+        message: "The approval dialog couldn't be shown on this Mac, so nobody approved this post. Nothing was sent.",
+      },
+      queue_full: {
+        code: "approval_queue_full",
+        message: `${this.o.approvals.max} posts to X were already waiting for approval, so this one wasn't shown. Nothing was sent.`,
+      },
+    };
+    this.failHeld(job, { ...failures[decision], rule: "x_write" });
   }
 
   /** The user's home folder and the state folder (for the download-folder rules). */
@@ -494,25 +654,54 @@ export class Jobs {
     return dirname(this.o.dir);
   }
 
-  /** The policy check tasks get (normalized text, the live policy file), for other text sent to a Bot. */
+  /**
+   * The policy check tasks get (normalized text, the policy as loaded at start), for other text sent to a Bot, such as
+   * routines. Approval is only for tasks, so in approve mode a posting routine is blocked as in block mode.
+   */
   checkPolicy(text: string): void {
-    this.enforce(text);
+    this.enforce(text, "other");
   }
 
-  /** Each rule on or off as loaded at start, plus warnings: rules turned off, or policy.json edited since. */
-  policyState(): { rules: Record<Rule, boolean>; warnings: string[] } {
+  /** x_write's mode and the other rules on or off as loaded at start, plus warnings. */
+  policyState(): { rules: { x_write: XMode } & Record<Exclude<Rule, "x_write">, boolean>; warnings: string[] } {
     const parsed = this.loadedPolicy().parsed;
-    const rules = Object.fromEntries(
-      RULES.map((r) => [r, !(parsed && typeof parsed === "object" && (parsed as Record<string, unknown>)[r] === false)]),
-    ) as Record<Rule, boolean>;
-    const warnings = RULES.filter((r) => !rules[r]).map((r) => `Safety rule ${r} is off (policy.json).`);
+    const x = xMode(parsed);
+    const rules = {
+      x_write: x.mode,
+      ...Object.fromEntries(
+        RULES.filter((r) => r !== "x_write").map((r) => [
+          r,
+          !(parsed && typeof parsed === "object" && (parsed as Record<string, unknown>)[r] === false),
+        ]),
+      ),
+    } as { x_write: XMode } & Record<Exclude<Rule, "x_write">, boolean>;
+    const warnings: string[] = [];
+    if (x.warning) warnings.push(x.warning);
+    if (x.mode === "allow") warnings.push("Posting to X is allowed without approval (x_write: allow).");
+    for (const r of RULES) if (r !== "x_write" && !rules[r]) warnings.push(`Safety rule ${r} is off (policy.json).`);
     if (this.policyChanged) warnings.push("policy.json changed; restart groklinkd to apply");
     return { rules, warnings };
   }
 
-  private enforce(text: string): void {
-    const r = check(policyText(text), this.loadedPolicy().parsed);
-    if (!r.ok) throw new PolicyError(r.rule);
+  /**
+   * Throw a PolicyError for any rule `text` breaks, except that in x_write approve mode an x_write match on a task
+   * returns true (the task needs the user's approval) instead. Approved tasks pass x_write.
+   */
+  private enforce(text: string, kind: "task" | "extra" | "other", approved = false, where = "an attachment or the schema"): boolean {
+    const parsed = this.loadedPolicy().parsed;
+    let needsApproval = false;
+    for (const rule of matches(policyText(text), parsed)) {
+      if (rule === "x_write" && xMode(parsed).mode === "approve") {
+        // Only the brief can ask to post: the dialog shows the whole brief and nothing else.
+        if (kind === "extra") throw this.notInBrief(where);
+        if (kind === "task") {
+          if (!approved) needsApproval = true;
+          continue;
+        }
+      }
+      throw new PolicyError(rule);
+    }
+    return needsApproval;
   }
 
   private loadedPolicy(): { parsed: unknown; raw: string | null } {
@@ -543,7 +732,8 @@ export class Jobs {
     let job = this.load(params.jobId);
     if (params.resume) job = this.resume(job);
     const ms = Math.min(Math.max(params.wait_seconds ?? 0, 0), 120) * 1000;
-    const running = (j: Job) => j.status === "working" || this.sending.has(j.jobId);
+    // A job waiting on the user's approval counts too, so a poll returns as soon as they decide.
+    const running = (j: Job) => j.status === "working" || j.status === "needs_approval" || this.sending.has(j.jobId);
     if (ms <= 0 || !running(job)) return job;
     return new Promise<Job>((resolve) => {
       const done = (j: Job) => {
@@ -591,6 +781,11 @@ export class Jobs {
       const job = this.active.get(disk.jobId) ?? disk;
       if (job.status === "needs_input" && !this.waiting.has(job.jobId) && !(await this.unanswered(job))) continue;
       this.active.set(job.jobId, job);
+      // The dialog didn't survive the restart. The mode may have changed too, so check again before asking.
+      if (job.status === "needs_approval") {
+        this.recheckHeld(job);
+        continue;
+      }
       if (job.status === "queued" && fromDisk && !job.briefKey) this.recovered.add(job.jobId);
       if (job.status === "queued" || this.waiting.has(job.jobId)) continue;
       this.follow(job);
@@ -598,6 +793,25 @@ export class Jobs {
       await sleep(5);
     }
     for (const botId of new Set([...this.active.values()].map((j) => j.botId))) void this.next(botId);
+  }
+
+  /** A held job after a restart: block → fail as blocked_by_policy; allow (or no longer posting) → queue; approve → ask. */
+  private recheckHeld(job: Job): void {
+    let needs: boolean;
+    try {
+      needs = this.enforce(job.brief, "task");
+      this.checkSchema(job.brief, job.schema);
+      this.checkFiles(job.files);
+    } catch (e) {
+      this.failHeld(job, jobError(e));
+      return;
+    }
+    if (needs) {
+      this.askApproval(job);
+      return;
+    }
+    job.status = "queued";
+    this.update(job);
   }
 
   /**
@@ -654,8 +868,18 @@ export class Jobs {
 
   private async dispatch(job: Job): Promise<void> {
     const brief = wrapBrief(job.brief, job.schema);
-    // The policy may have changed since the job was queued.
-    this.enforce(brief);
+    // Re-checked at send time: a job queued before a restart in another mode gets the current policy, and an approval
+    // never covers posting asked in the schema or an attachment.
+    this.checkSchema(job.brief, job.schema);
+    this.checkFiles(job.files);
+    if (this.enforce(brief, "task", !!job.approvedAt)) {
+      this.sending.delete(job.jobId);
+      job.status = "needs_approval";
+      this.update(job);
+      this.askApproval(job);
+      void this.next(job.botId);
+      return;
+    }
     const sent = this.recovered.delete(job.jobId) ? await this.alreadySent(job, brief) : null;
     if (sent) this.o.log(`job ${job.jobId} brief was already sent before the restart; not sending again`);
     job.briefKey = sent ?? (await this.o.layer.send(job.botId, brief, job.files));
@@ -831,7 +1055,8 @@ export class Jobs {
         }
         const repair = `Your JSON didn't match the schema: ${errors.slice(0, 5).join("; ")}. Send only the corrected json block.`;
         try {
-          this.enforce(repair);
+          // An approval covers the brief the user saw, never repair text: it quotes names from the Bot's own answer.
+          if (this.enforce(repair, "task")) throw new PolicyError("x_write");
           anchor = await this.o.layer.send(job.botId, repair, []);
         } catch (e) {
           return this.finish(job, "failed", e instanceof PolicyError ? jobError(e) : { code: "internal", message: (e as Error).message });

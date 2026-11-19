@@ -68,7 +68,7 @@ Copies the Grok Link skill to `~/.claude/skills/groklink/SKILL.md`. The skill te
 |---|---|
 | `groklink_bots` | List your Bots |
 | `groklink_task` | `{ bot, brief, files?, schema? }` → `{ jobId, status }` |
-| `groklink_job` | `{ jobId, wait_seconds? (0–120, default 0), resume? }` → the full job |
+| `groklink_job` | `{ jobId, wait_seconds? (0–50 over MCP, default 0), resume? }` → the full job |
 | `groklink_jobs` | `{ status? }` → jobs (id, bot, status, updatedAt) |
 | `groklink_events` | `{ since_seq?, limit? (default 50) }` → events after a sequence number |
 | `groklink_read` | `{ bot, limit?, since? }` → messages in a Bot's conversation |
@@ -93,7 +93,7 @@ groklink events --since 0
 
 A job goes `queued` → `working` → `done`, `needs_input` (the Bot is waiting for you in the app) or `failed`. A job with no Bot activity for 45 minutes becomes `stale`; `groklink_job` with `resume: true` picks it up again. One job runs per Bot at a time; others queue.
 
-To follow a job, call `groklink_job` with `wait_seconds` (up to 120). It returns as soon as the job leaves `working`, or when the time runs out. Then call it again. Jobs live in `~/.groklink/jobs/` and survive daemon and app restarts; job files are deleted after 7 days.
+To follow a job, call `groklink_job` with `wait_seconds` (up to 50 over MCP, since some clients time out a tool call after about a minute; `groklink job --wait` allows 120). It returns as soon as the job leaves `working`, or when the time runs out. Then call it again. Jobs live in `~/.groklink/jobs/` and survive daemon and app restarts; job files are deleted after 7 days.
 
 Every Bot message, status change and finished job is also appended to an event log (`~/.groklink/events.jsonl`) with a strictly increasing `seq`; events older than 7 days are pruned too. Poll `groklink_events` with the last `seq` you saw to watch all Bots at once. Message events, Bot previews and routine results are flagged `untrusted: true`.
 
@@ -142,12 +142,14 @@ Supported keywords: `type` (`object`, `array`, `string`, `number`, `integer`, `b
 `~/.groklink/policy.json` is created on first start with every rule on:
 
 ```json
-{ "x_write": true, "tx": true, "wallet": true, "claim": true }
+{ "x_write": "block", "tx": true, "wallet": true, "claim": true }
 ```
+
+`groklink policy` shows each rule and its mode.
 
 | Rule | Blocks briefs that ask a Bot to… |
 |---|---|
-| `x_write` | post, tweet, reply, quote, repost, like, follow, DM, share, send, upload, thread, boost or amplify on X, an @handle or your account, timeline or profile (as a command, so "find posts like this on X" still works) |
+| `x_write` | (in `block` mode; see Posting to X) post, tweet, reply, quote, repost, like, follow, DM, share, send, upload, thread, boost or amplify on X, an @handle or your account, timeline or profile (as a command, so "find posts like this on X" still works) |
 | `tx` | sign, send, approve, confirm, authorize, accept, broadcast or execute a transaction, permit, swap, transfer, approval, contract call, bridge or wallet request (verb and target within 10 words, in either order; "send me…" and "confirm whether…" don't count) |
 | `wallet` | connect a wallet, or anything mentioning a seed phrase, private key or mnemonic |
 | `claim` | submit a claim |
@@ -156,7 +158,35 @@ A blocked task fails with `blocked_by_policy` and the rule's name, and nothing i
 
 **The policy is a best-effort seatbelt, not a sandbox.** It matches phrases, so a determined or unusual wording can get past it.
 
-To turn a rule off, edit `policy.json`, set it to `false` (for example `"x_write": false`), and restart the daemon (`launchctl kickstart -k gui/$(id -u)/dev.groklink.daemon`). The daemon reads the file only at start: if it changes while running, the change isn't applied and `groklink_health` warns "policy.json changed; restart groklinkd to apply". `groklink_health` also shows each rule in `policy`, with a warning for any that's off. There's no per-call override. You, as the owner, can turn rules off; so can any program running with your file access, including a coding agent, if it also restarts the daemon. A missing key, or a missing or broken file, means the rule is on.
+To turn `tx`, `wallet` or `claim` off, edit `policy.json`, set it to `false` (for example `"tx": false`), and restart the daemon (`launchctl kickstart -k gui/$(id -u)/dev.groklink.daemon`). The daemon reads the file only at start: if it changes while running, the change isn't applied and `groklink_health` warns "policy.json changed; restart groklinkd to apply". `groklink_health` also shows each rule in `policy`, with a warning for any that's off. There's no per-call override. You, as the owner, can turn rules off; so can any program running with your file access, including a coding agent, if it also restarts the daemon. A missing key, or a missing or broken file, means the rule is on.
+
+### Posting to X
+
+`x_write` has three modes instead of on/off:
+
+| Mode | A brief that asks a Bot to post on X… |
+|---|---|
+| `block` (default) | is refused with `blocked_by_policy`; nothing is sent |
+| `approve` | is held as `needs_approval`, and a dialog opens on your Mac showing the Bot and the whole brief. **Approve and send** queues the task as normal. **Deny** fails it with `approval_denied`; no answer within 10 minutes fails it with `approval_timeout`. Only one dialog shows at a time; others wait their turn |
+| `allow` | goes through with no check; `groklink_health` warns "Posting to X is allowed without approval (x_write: allow)." |
+
+Pick one with:
+
+```bash
+groklink policy x_write approve
+```
+
+This rewrites `policy.json` (through a symlink, if yours is one) and restarts the daemon so the mode applies. No MCP tool or socket call can approve a task or change the mode, so an agent that only has Grok Link's tools can only ask, and you click. But any program with your shell or file access, including a coding agent that can run commands, can change the mode with `groklink policy` or by editing `policy.json`. Approval covers tasks only; in `approve` mode a routine that would post is blocked, as in `block` mode. Other rules still apply to an approved task.
+
+In `approve` mode, the post must be asked for in the brief itself, so the dialog shows you everything that asks for it:
+- A task that needs approval can't have attachments or a JSON Schema (`blocked_by_policy`): put the post's text in the brief. A posting request hidden in an attachment or schema of any other task is blocked too.
+- Approve mode accepts plain text only. Every character of a posting brief must be printable ASCII, a newline, or an emoji. At most 40 lines, no more than 2 blank lines in a row, and at most 1,500 characters. Anything else is blocked: accented or look-alike letters (such as a Cyrillic "а" in a handle), tabs, invisible or blank-looking characters, bidi overrides. That way what the dialog shows reads exactly like what's sent.
+- The dialog shows the brief exactly as it will be sent.
+- At most 5 tasks wait for approval at once; another fails with `approval_queue_full`.
+- If the dialog can't be shown (for example, nobody is logged in to the Mac's screen), the task fails with `approval_error`.
+- After a daemon restart, held tasks follow the mode then in force: `block` fails them, `allow` sends them, and `approve` asks again.
+
+Old files keep working: `"x_write": true` is `block`, `false` is `allow`, and an unknown value is `block` with a warning. `groklink doctor` shows the mode, with a `!` line when it's `allow`.
 
 ## Security model
 

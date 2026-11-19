@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 // groklink CLI: `groklink mcp` runs the stdio MCP server; the other commands call the daemon once and print JSON.
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { statePaths } from "../daemon/state.ts";
+import { loadPolicy, policyFileError, RULES, writeXMode, X_MODES, type XMode, xMode } from "../shared/policy.ts";
 import type { Method } from "../shared/protocol.ts";
 import { VERSION } from "../shared/version.ts";
-import { defaultEnv, install, installSkill, uninstall } from "./install.ts";
+import { defaultEnv, install, installSkill, LABEL, uninstall } from "./install.ts";
 import { serveMcp } from "./mcp.ts";
 import { call } from "./socket.ts";
 
@@ -23,7 +26,10 @@ Usage:
   groklink install [--dry-run] [--replace-grokbot-bridge]
                                                  Run the daemon at login and register the MCP server in your clients
   groklink install --skill [--force] [--dry-run] Add the agent skill to ~/.claude/skills/groklink/ (only that)
-  groklink uninstall [--dry-run]                 Undo install (keeps the state folder)`;
+  groklink uninstall [--dry-run]                 Undo install (keeps the state folder)
+  groklink policy                                Show each safety rule and its mode
+  groklink policy x_write <block|approve|allow>  How Bots may post to X: block (default), approve (you approve
+                                                 each posting task in a dialog on this Mac) or allow; restarts the daemon`;
 
 class UsageError extends Error {}
 
@@ -182,6 +188,20 @@ async function doctor(args: string[]): Promise<number> {
     const { code = "internal", message } = e as { code?: string; message: string };
     checks = [{ name: "daemon", ok: false, detail: `${code}: ${String(message).split("\n")[0]}` }];
   }
+  // How Bots may post to X; `!` when it's allowed without approval. Older daemons report a boolean.
+  const policy = (health as DeepHealth | null)?.policy as Record<string, unknown> | null | undefined;
+  if (health?.probe && policy && "x_write" in policy) {
+    const mode = xMode({ x_write: policy.x_write }).mode;
+    checks = [
+      ...checks,
+      {
+        name: "policy",
+        ok: true,
+        ...(mode === "allow" ? { warn: true } : {}),
+        detail: mode === "allow" ? "x_write: allow (Bots may post to X without approval)" : `x_write: ${mode}`,
+      },
+    ];
+  }
   for (const c of checks) say(line(c));
 
   let send: (Check & { jobId?: string }) | undefined;
@@ -203,6 +223,37 @@ async function doctor(args: string[]): Promise<number> {
   return failed ? 1 : 0;
 }
 
+// ---- policy ----
+
+/** `groklink policy`: each rule's mode as policy.json says (what the daemon applies after its next start). */
+function showPolicy(file: string): void {
+  const parsed = loadPolicy(file);
+  const x = xMode(parsed);
+  const on = (r: string) => !(parsed && typeof parsed === "object" && (parsed as Record<string, unknown>)[r] === false);
+  console.log(`Policy: ${file}`);
+  const broken = policyFileError(file);
+  if (broken) console.log(`Can't read it (${broken}); the daemon treats every rule as on (x_write: block) until it's fixed.`);
+  for (const r of RULES) console.log(`  ${r.padEnd(8)} ${r === "x_write" ? x.mode : on(r) ? "on" : "off"}`);
+  if (x.warning) console.log(x.warning);
+}
+
+/** `groklink policy x_write <mode>`: rewrite policy.json atomically (0600), then restart the daemon to apply it. */
+function setXMode(file: string, mode: string): number {
+  if (!(X_MODES as readonly string[]).includes(mode)) throw new UsageError(`x_write must be one of ${X_MODES.join(", ")}.`);
+  writeXMode(file, mode as XMode);
+  console.log(`Set x_write to ${mode} in ${file}.`);
+  if (mode === "allow") console.log("Bots may now post to X without asking you.");
+  if (mode === "approve") console.log("Tasks that would post to X now wait for you to click Approve in a dialog on this Mac.");
+  const uid = process.getuid?.() ?? 0;
+  const r = spawnSync("launchctl", ["kickstart", "-k", `gui/${uid}/${LABEL}`], { stdio: "ignore" });
+  if (r.status === 0) {
+    console.log(`Restarted the daemon (launchctl kickstart -k gui/${uid}/${LABEL}) so the new mode applies.`);
+    return 0;
+  }
+  console.log(`Couldn't restart the daemon with launchctl. Restart groklinkd yourself to apply the new mode.`);
+  return 1;
+}
+
 const [cmd = "", ...args] = process.argv.slice(2);
 if (cmd === "mcp") {
   serveMcp();
@@ -210,6 +261,23 @@ if (cmd === "mcp") {
   console.log(VERSION);
 } else if (cmd === "--help" || cmd === "-h" || cmd === "help") {
   console.log(USAGE);
+} else if (cmd === "policy") {
+  try {
+    const file = statePaths().policy;
+    if (args.length === 0) {
+      showPolicy(file);
+      process.exit(0);
+    }
+    if (args.length !== 2 || args[0] !== "x_write") throw new UsageError("policy takes no arguments, or: x_write <block|approve|allow>.");
+    process.exit(setXMode(file, args[1]));
+  } catch (e) {
+    if (e instanceof UsageError) {
+      console.error(`${e.message}\n\n${USAGE}`);
+      process.exit(2);
+    }
+    console.error(`groklink policy: ${(e as Error).message}`);
+    process.exit(1);
+  }
 } else if (cmd === "doctor") {
   try {
     process.exit(await doctor(args));

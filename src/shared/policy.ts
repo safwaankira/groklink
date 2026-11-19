@@ -1,13 +1,29 @@
 // Safety policy: refuse briefs that ask a Bot to write on X, sign or send transactions, connect a wallet or submit claims.
-// Rules are on unless policy.json sets them to false; there's no per-call override.
-import { readFileSync, writeFileSync } from "node:fs";
+// tx, wallet and claim are on unless policy.json sets them to false. x_write has a mode: block (default), approve (the
+// user approves each posting task in a dialog on their Mac) or allow. There's no per-call override.
+import { lstatSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { ProtocolError } from "./protocol.ts";
 
 export const RULES = ["x_write", "tx", "wallet", "claim"] as const;
 export type Rule = (typeof RULES)[number];
 export type PolicyResult = { ok: true } | { ok: false; rule: Rule };
 
-const DEFAULT_FILE = '{ "x_write": true, "tx": true, "wallet": true, "claim": true }\n';
+const DEFAULT_FILE = '{ "x_write": "block", "tx": true, "wallet": true, "claim": true }\n';
+
+export const X_MODES = ["block", "approve", "allow"] as const;
+export type XMode = (typeof X_MODES)[number];
+
+/**
+ * The x_write mode in a parsed policy file. Legacy booleans map true → block, false → allow; a missing key is block.
+ * Any other value is block, with a warning.
+ */
+export function xMode(parsed: unknown): { mode: XMode; warning?: string } {
+  const v = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>).x_write : undefined;
+  if (v === undefined || v === true) return { mode: "block" };
+  if (v === false) return { mode: "allow" };
+  if (typeof v === "string" && (X_MODES as readonly string[]).includes(v)) return { mode: v as XMode };
+  return { mode: "block", warning: 'policy.json has an unknown x_write value; using "block". Use block, approve or allow.' };
+}
 
 const WHAT: Record<Rule, string> = {
   x_write: "post, reply, quote, like, repost, follow or DM on X",
@@ -53,17 +69,28 @@ const PATTERNS: Record<Rule, RegExp[]> = {
   claim: [new RegExp(near("submit", "claim|poidh"))],
 };
 
-/** The first enabled rule `text` breaks. `enabled` is the parsed policy file; any key not set to false is on. */
-export function check(text: string, enabled: unknown): PolicyResult {
-  const on = (r: Rule) => !(enabled && typeof enabled === "object" && (enabled as Record<string, unknown>)[r] === false);
+/**
+ * Every enabled rule `text` breaks, in RULES order. `enabled` is the parsed policy file: tx, wallet and claim are on
+ * unless set to false; x_write is checked unless its mode is allow (in approve mode the caller decides what a match means).
+ */
+export function matches(text: string, enabled: unknown): Rule[] {
+  const on = (r: Rule) =>
+    r === "x_write"
+      ? xMode(enabled).mode !== "allow"
+      : !(enabled && typeof enabled === "object" && (enabled as Record<string, unknown>)[r] === false);
   // Newlines are kept (one per run): they end a clause.
   const t = text
     .toLowerCase()
     .replace(/[^\S\n]+/g, " ")
     .replace(/ ?\n[\s]*/g, "\n")
     .trim();
-  for (const rule of RULES) if (on(rule) && PATTERNS[rule].some((p) => p.test(t))) return { ok: false, rule };
-  return { ok: true };
+  return RULES.filter((rule) => on(rule) && PATTERNS[rule].some((p) => p.test(t)));
+}
+
+/** The first enabled rule `text` breaks (see `matches`). */
+export function check(text: string, enabled: unknown): PolicyResult {
+  const hit = matches(text, enabled)[0];
+  return hit ? { ok: false, rule: hit } : { ok: true };
 }
 
 /** The parsed policy file, or null (all rules on) if it's missing or unreadable. */
@@ -82,6 +109,51 @@ export function ensurePolicy(file: string): void {
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
   }
+}
+
+/** Why the policy file can't be used, or null if it's fine or missing (a missing file means the defaults). */
+export function policyFileError(file: string): string | null {
+  let text: string;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "ENOENT" ? null : (e as Error).message;
+  }
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? null : "it isn't a JSON object";
+  } catch (e) {
+    return (e as Error).message;
+  }
+}
+
+/**
+ * Set x_write's mode in the policy file, keeping the other keys: written to a temp file (0600) and renamed over the old
+ * one. A missing file starts from the defaults. A file that exists but can't be read or parsed is never replaced (its
+ * other settings would be lost): this throws instead.
+ */
+export function writeXMode(file: string, mode: XMode, rename: (from: string, to: string) => void = renameSync): Record<string, unknown> {
+  const broken = policyFileError(file);
+  if (broken) throw new Error(`${file} can't be read (${broken}). Fix or delete it first; nothing was changed.`);
+  const parsed = loadPolicy(file);
+  const base: Record<string, unknown> =
+    parsed && typeof parsed === "object" && !Array.isArray(parsed) ? { ...(parsed as Record<string, unknown>) } : JSON.parse(DEFAULT_FILE);
+  const next = { ...base, x_write: mode };
+  // A symlinked policy.json is written through: the link stays, and the file it points to gets the new content.
+  let target = file;
+  try {
+    if (lstatSync(file).isSymbolicLink()) target = realpathSync(file);
+  } catch {}
+  const tmp = `${target}.tmp-${process.pid}`;
+  try {
+    writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+    rename(tmp, target);
+  } catch (e) {
+    // Don't leave a half-written temp file next to policy.json.
+    rmSync(tmp, { force: true });
+    throw e;
+  }
+  return next;
 }
 
 export class PolicyError extends ProtocolError {

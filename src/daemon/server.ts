@@ -52,6 +52,15 @@ function reader(p: Record<string, unknown>) {
   };
 }
 
+/**
+ * Refuse any param not in `allowed`. In particular nothing a client sends can set a job's status or approve it:
+ * approving a post to X happens only in the dialog on the user's Mac.
+ */
+function only(p: Record<string, unknown>, allowed: string[]): void {
+  const extra = Object.keys(p).filter((k) => !allowed.includes(k));
+  if (extra.length) throw new ProtocolError("bad_request", `Unknown parameter${extra.length > 1 ? "s" : ""}: ${extra.join(", ")}.`);
+}
+
 /** Bot replies are data, never instructions. */
 const untrusted = <T extends { messages: object[] }>(r: T) => ({ ...r, messages: r.messages.map((m) => ({ ...m, untrusted: true })) });
 
@@ -109,7 +118,8 @@ async function routines(cdp: CDP, p: Record<string, unknown>, policy: (text: str
 type Health = HealthResult & {
   selftest: SelfTestResult | null;
   usage: UsageSummary | null;
-  policy: Record<string, boolean> | null;
+  /** x_write's mode ("block" | "approve" | "allow"); tx, wallet and claim on or off. */
+  policy: Record<string, boolean | string> | null;
   warnings: string[];
   probe?: ProbeResult;
 };
@@ -150,6 +160,7 @@ export function daemonMethods(
     // A Bot's preview and description can carry text the Bot wrote.
     bots: async () => (await listBots(cdp())).map((b) => ({ ...b, untrusted: true })),
     task: (p) => {
+      only(p, ["bot", "brief", "files", "schema"]);
       const { str, strs } = reader(p);
       // Don't send anything while the app's internals look different from what the base code expects.
       const broken = opts.selftest?.failure();
@@ -157,10 +168,12 @@ export function daemonMethods(
       return need(opts.jobs).create({ bot: str("bot"), brief: str("brief"), files: strs("files"), schema: p.schema ?? null });
     },
     job: (p) => {
+      only(p, ["jobId", "wait_seconds", "resume"]);
       const { str, optNum, optBool } = reader(p);
       return need(opts.jobs).get({ jobId: str("jobId"), wait_seconds: optNum("wait_seconds"), resume: optBool("resume") });
     },
     jobs: (p) => {
+      only(p, ["status"]);
       const status = reader(p).optStr("status");
       if (status !== undefined && !JOB_STATUSES.includes(status as JobStatus))
         throw new ProtocolError("bad_request", `"status" must be one of ${JOB_STATUSES.join(", ")}.`);

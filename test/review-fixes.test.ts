@@ -145,12 +145,12 @@ test("health shows each rule on/off and warns when policy.json changes after sta
     { mode: "pipe", connected: true, appVersion: "1.2.0", requireCdp: () => new CDP({ send() {}, onMessage() {}, close() {} }) },
     { jobs: j },
   );
-  const health = () => methods.health({}) as { policy: Record<string, boolean>; warnings: string[] };
-  assert.deepEqual(health().policy, { x_write: true, tx: true, wallet: true, claim: true });
+  const health = () => methods.health({}) as { policy: Record<string, boolean | string>; warnings: string[] };
+  assert.deepEqual(health().policy, { x_write: "block", tx: true, wallet: true, claim: true });
   assert.deepEqual(health().warnings, []);
   writeFileSync(join(stateHome, "policy.json"), '{ "x_write": false }');
   await until(() => health().warnings.includes("policy.json changed; restart groklinkd to apply"));
-  assert.equal(health().policy.x_write, true, "the edit isn't applied");
+  assert.equal(health().policy.x_write, "block", "the edit isn't applied");
   await assert.rejects(j.create({ bot: "Alpha", brief: "post this on X" }), { code: "blocked_by_policy" });
 });
 

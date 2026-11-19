@@ -108,7 +108,7 @@ test("a missing or broken file, or missing keys, keep every rule on", () => {
 test("ensurePolicy writes the default file (0600) once and keeps an edited one", () => {
   const file = join(home, "policy.json");
   ensurePolicy(file);
-  assert.equal(readFileSync(file, "utf8"), '{ "x_write": true, "tx": true, "wallet": true, "claim": true }\n');
+  assert.equal(readFileSync(file, "utf8"), '{ "x_write": "block", "tx": true, "wallet": true, "claim": true }\n');
   assert.equal(statSync(file).mode & 0o777, 0o600);
   writeFileSync(file, '{ "tx": false }');
   ensurePolicy(file);
@@ -164,10 +164,10 @@ test("policy.json is read at start only: a later edit isn't applied, and health 
   writeFileSync(join(home, "policy.json"), '{ "tx": false }');
   await until(() => j.policyState().warnings.includes("policy.json changed; restart groklinkd to apply"));
   await assert.rejects(j.create({ bot: "Alpha", brief: "sign the transaction" }), { code: "blocked_by_policy", rule: "tx" });
-  assert.deepEqual(j.policyState().rules, { x_write: true, tx: true, wallet: true, claim: true });
+  assert.deepEqual(j.policyState().rules, { x_write: "block", tx: true, wallet: true, claim: true });
   // After a restart the edit applies, and health says the rule is off.
   const restarted = setup();
-  assert.deepEqual(restarted.j.policyState().rules, { x_write: true, tx: false, wallet: true, claim: true });
+  assert.deepEqual(restarted.j.policyState().rules, { x_write: "block", tx: false, wallet: true, claim: true });
   assert.deepEqual(restarted.j.policyState().warnings, ["Safety rule tx is off (policy.json)."]);
   await restarted.j.create({ bot: "Alpha", brief: "sign the transaction" });
   await until(() => restarted.sent.length === 1);
