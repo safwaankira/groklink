@@ -47,7 +47,12 @@ Call `groklink_job` with `{ jobId, wait_seconds }`, where `wait_seconds` is at m
   - sign or send transactions, connect a wallet, or submit claims.
 - Don't attach secrets, keys or private files. The daemon blocks many sensitive files anyway.
 
-## 5. Files and other tools
+## 5. Asleep Bots and blocked files
+- **`bot_asleep`:** the Bot's computer is asleep. Grok Bot parks it when its window has been in the background for 10+ minutes. Grok Link already tried to wake it once. Ask the user to bring the Grok Bot window to the front, wait `retryAfterSec` (10 s), then retry **once**. Never loop.
+- **`file_blocked`:** the file matched an attachment rule (the message names the rule and the file). Don't retry with the same file or a renamed copy; tell the user.
+- **`no_files`:** the Bot hasn't sent any files to download.
+
+## 6. Files and other tools
 - **Downloads:** `groklink_download` saves the files a Bot sent to `~/.groklink/downloads/<bot>/` by default and returns the paths. Other folders must be under `~/Downloads/groklink` or listed in `~/.groklink/download-roots.json`.
 - **Reading and stopping:** `groklink_read` shows recent messages in a Bot's conversation. `groklink_stop` interrupts a Bot, like the app's Stop button.
 - **Routines:** `groklink_routines` manages scheduled routines. Change them only when the user asks. `remove` needs `confirm` set to the routine's exact name.

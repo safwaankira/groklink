@@ -4,6 +4,8 @@
 // Grok Bot has put the Bot's computer to sleep (see BOX_PHASE in page.ts) and never needs the Grok Bot
 // window in front. Routines added through the app's store from here didn't persist in testing, so the
 // store is only used to read routines and to run one now, and only while the computer is awake.
+
+import { BotAsleepError } from "../shared/protocol.ts";
 import { ask, findBot, type Message, type WaitOptions, type WaitStatus } from "./bot.ts";
 import type { CDP } from "./cdp.ts";
 import { BOX_PHASE, PAGE_ERROR, store } from "./page.ts";
@@ -67,19 +69,10 @@ const PAGE_ROUTINES = `async (op, id, arg) => {
   }
 }`;
 
-function asleepMessage(bot: string, phase: string): string {
-  return `${bot}'s computer is asleep (Grok Bot phase "${phase}"), so Grok Bot can't show its routines right now. It wakes the next time you open Grok Bot. Routine changes still work: they go through the Bot.`;
-}
-
 async function pageOp<T>(cdp: CDP, op: "list" | "run", bot: { id: string; name: string }, arg?: string): Promise<T> {
   const r = await cdp.call<{ value?: T; error?: string; asleep?: string }>(PAGE_ROUTINES, op, bot.id, arg ?? null);
-  if (r.asleep !== undefined) {
-    throw new Error(
-      op === "run"
-        ? `${bot.name}'s computer is asleep, and Bots can't start a routine on demand. It will run on its schedule, or run this again after you next open Grok Bot.`
-        : asleepMessage(bot.name, r.asleep),
-    );
-  }
+  // Reading or running routines needs the Bot's computer awake; the caller may wake it and retry.
+  if (r.asleep !== undefined) throw new BotAsleepError(bot.name);
   if (r.error !== undefined) throw new Error(r.error);
   return r.value as T;
 }

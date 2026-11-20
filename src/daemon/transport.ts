@@ -288,6 +288,16 @@ export class Transport {
     throw new ProtocolError("not_connected", "groklinkd isn't connected to Grok Bot yet. It retries every 5 s; check daemon.log.");
   }
 
+  /**
+   * Bring the Grok Bot window to the front, the way the app is woken by hand: Grok Bot parks a Bot's computer
+   * ("away") while its window has been unfocused for 10 minutes, and wakes it once the window is focused again.
+   * CDP's Page.bringToFront first, then the macOS reopen/activate a Dock click sends. This takes focus from the user.
+   */
+  async wake(): Promise<void> {
+    await this.cdp?.send("Page.bringToFront").catch(() => {});
+    await reopenApp();
+  }
+
   start(): void {
     void this.connect();
   }

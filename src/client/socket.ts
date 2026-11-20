@@ -8,13 +8,20 @@ const NOT_RUNNING =
   "Grok Link daemon isn't running. Start it with: groklink install (or launchctl kickstart gui/$(id -u)/dev.groklink.daemon)";
 
 /**
- * The daemon's error as a ProtocolError. A policy block keeps its `rule`, both as a field and as a
- * `rule: <name>` line in the message, so MCP clients (which see only the text) get it too.
+ * The daemon's error as a ProtocolError. A policy or file block keeps its `rule`, and a `bot_asleep` error its
+ * `retryAfterSec`, both as fields and as `rule: <name>` / `retryAfterSec: <n>` lines in the message, so MCP clients
+ * (which see only the text) get them too.
  */
-function daemonError(e: { code: string; message: string; rule?: unknown }): ProtocolError {
+function daemonError(e: { code: string; message: string; rule?: unknown; retryAfterSec?: unknown }): ProtocolError {
   const rule = typeof e.rule === "string" ? e.rule : undefined;
-  const err = new ProtocolError(e.code as ErrorCode, rule ? `${e.message}\nrule: ${rule}` : e.message);
-  return rule ? Object.assign(err, { rule }) : err;
+  const retryAfterSec = typeof e.retryAfterSec === "number" ? e.retryAfterSec : undefined;
+  const lines = [
+    e.message,
+    ...(rule ? [`rule: ${rule}`] : []),
+    ...(retryAfterSec !== undefined ? [`retryAfterSec: ${retryAfterSec}`] : []),
+  ];
+  const err = new ProtocolError(e.code as ErrorCode, lines.join("\n"));
+  return Object.assign(err, rule ? { rule } : {}, retryAfterSec !== undefined ? { retryAfterSec } : {});
 }
 
 /** Send one request to the daemon and return its result, or throw a ProtocolError with the daemon's `{ code, message }`. */

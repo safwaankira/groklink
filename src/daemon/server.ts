@@ -6,9 +6,10 @@ import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { checkDownloadDir, download, findBot, listBots, read, safeFileName, stop, usage } from "../base/bot.ts";
 import type { CDP } from "../base/cdp.ts";
+import { BOX_PHASE } from "../base/page.ts";
 import { createBot, deleteBot, updateBot } from "../base/roster.ts";
 import { changeRoutine, listRoutines, type Routine, type RoutineChange, runRoutine } from "../base/routines.ts";
-import { type HealthResult, ProtocolError, type Response, type TransportMode } from "../shared/protocol.ts";
+import { BotAsleepError, type HealthResult, ProtocolError, type Response, type TransportMode } from "../shared/protocol.ts";
 import type { EventLog } from "./events.ts";
 import { JOB_STATUSES, type JobStatus, type Jobs, type UsageSummary } from "./jobs.ts";
 import { deepProbe, type ProbeResult, probeWarnings } from "./probe.ts";
@@ -18,8 +19,93 @@ import { type Log, statePaths } from "./state.ts";
 export type Handler = (params: Record<string, unknown>) => unknown;
 export type Methods = Record<string, Handler>;
 
-/** What the methods need from the transport. Tests pass a fake. */
-export type Link = { mode: TransportMode; connected: boolean; appVersion: string | null; requireCdp(): CDP };
+/** What the methods need from the transport. Tests pass a fake. `wake` brings the Grok Bot window to the front. */
+export type Link = { mode: TransportMode; connected: boolean; appVersion: string | null; requireCdp(): CDP; wake?(): Promise<void> };
+
+/** Text of the errors that mean the Bot's computer is asleep (ours and the app's), wherever they were thrown. */
+const ASLEEP_TEXT = /computer is asleep|put the Bot's computer to sleep|sand-box-blocked|SAND_AWAY_PARK/;
+const ASLEEP_PHASES = ["away", "asleep"];
+
+export function isAsleep(e: unknown): boolean {
+  return e instanceof BotAsleepError || ASLEEP_TEXT.test(String((e as Error)?.message ?? e));
+}
+
+export type WakeOptions = {
+  /** How long to wait for the computer to wake after bringing the window to the front (15 s). */
+  waitMs?: number;
+  pollMs?: number;
+  /** Bring the window to the front at most once per this long per Bot (60 s): it takes focus from the user. */
+  cooldownMs?: number;
+  now?: () => number;
+};
+
+/**
+ * One automatic wake for a call that failed because the Bot's computer was asleep: bring the Grok Bot window to the
+ * front (as the user would), wait for the computer to leave "away"/"asleep", and retry the call once. Otherwise, or if
+ * it's still asleep, the call fails with `bot_asleep`.
+ */
+export class Waker {
+  private last = new Map<string, number>();
+  private o: Required<WakeOptions>;
+  private link: Link;
+  private log: Log;
+
+  constructor(link: Link, log: Log, opts: WakeOptions = {}) {
+    this.link = link;
+    this.log = log;
+    this.o = { waitMs: 15_000, pollMs: 500, cooldownMs: 60_000, now: Date.now, ...opts };
+  }
+
+  /** Run `fn`; if it fails because `bot`'s computer is asleep, wake it once and retry once. */
+  async attempt<T>(method: string, bot: string, fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (e) {
+      if (!isAsleep(e)) throw e;
+      const name = e instanceof BotAsleepError && e.bot ? e.bot : bot;
+      if (!(await this.wake(name, method))) throw new BotAsleepError(name);
+      try {
+        return await fn();
+      } catch (again) {
+        throw isAsleep(again) ? new BotAsleepError(name) : again;
+      }
+    }
+  }
+
+  private async wake(bot: string, method: string): Promise<boolean> {
+    const key = bot.toLowerCase();
+    const now = this.o.now();
+    const last = this.last.get(key);
+    if (last !== undefined && now - last < this.o.cooldownMs) {
+      this.log(`wake skipped for ${bot} (${method}): woken less than ${Math.round(this.o.cooldownMs / 1000)} s ago`);
+      return false;
+    }
+    if (!this.link.wake) {
+      this.log(`wake failed for ${bot} (${method}): no window to bring to the front`);
+      return false;
+    }
+    this.last.set(key, now);
+    try {
+      await this.link.wake();
+      for (const deadline = Date.now() + this.o.waitMs; ; ) {
+        const phase = await this.link
+          .requireCdp()
+          .eval<unknown>(BOX_PHASE)
+          .catch(() => null);
+        const awake = typeof phase === "string" && !ASLEEP_PHASES.includes(phase);
+        // Settled is fully awake; any other non-sleeping phase is good enough once time is up.
+        if (phase === "settled" || (awake && Date.now() >= deadline)) {
+          this.log(`woke ${bot} for ${method}`);
+          return true;
+        }
+        if (Date.now() >= deadline) break;
+        await new Promise((r) => setTimeout(r, this.o.pollMs));
+      }
+    } catch {}
+    this.log(`wake failed for ${bot} (${method}): still asleep after ${Math.round(this.o.waitMs / 1000)} s`);
+    return false;
+  }
+}
 
 const MAX_LINE = 1024 * 1024;
 
@@ -129,10 +215,20 @@ export type SelfTestState = { result: SelfTestResult | null; failure(): string |
 
 export function daemonMethods(
   link: Link,
-  opts: { jobs?: Jobs; events?: EventLog; selftest?: SelfTestState; startedAt?: number } = {},
+  opts: { jobs?: Jobs; events?: EventLog; selftest?: SelfTestState; startedAt?: number; log?: Log; wake?: WakeOptions } = {},
 ): Methods {
   const startedAt = opts.startedAt ?? Date.now();
   const cdp = () => link.requireCdp();
+  const waker = new Waker(link, opts.log ?? (() => {}), opts.wake);
+  /** An asleep failure from a call that isn't retried (it may have messaged the Bot) still gets the bot_asleep code. */
+  const asleepAs = async <T>(bot: string, fn: () => Promise<T>): Promise<T> => {
+    try {
+      return await fn();
+    } catch (e) {
+      if (isAsleep(e) && !(e instanceof BotAsleepError)) throw new BotAsleepError(bot);
+      throw e;
+    }
+  };
   const need = <T>(v: T | undefined): T => {
     if (!v) throw new ProtocolError("internal", "Jobs aren't set up in this daemon.");
     return v;
@@ -189,7 +285,9 @@ export function daemonMethods(
     },
     read: async (p) => {
       const { str, optNum, optStr } = reader(p);
-      return untrusted(await read(cdp(), str("bot"), { limit: optNum("limit"), since: optStr("since") }));
+      return untrusted(
+        await waker.attempt("read", str("bot"), () => read(cdp(), str("bot"), { limit: optNum("limit"), since: optStr("since") })),
+      );
     },
     stop: (p) => stop(cdp(), reader(p).str("bot")),
     download: async (p) => {
@@ -201,16 +299,30 @@ export function daemonMethods(
       const dir = outDir ?? join(where.stateHome, "downloads", safeFileName(bot.name));
       // Checked before anything is created, and again on the real folder once it exists.
       checkDownloadDir(dir, where);
-      return download(cdp(), bot.id, strs("keys"), dir, (real) => {
-        checkDownloadDir(real, where);
-      });
+      // Each read from the Bot's computer gets the one wake-and-retry, so a retry never saves a file twice.
+      return download(
+        cdp(),
+        bot.id,
+        strs("keys"),
+        dir,
+        (real) => {
+          checkDownloadDir(real, where);
+        },
+        (fn) => waker.attempt("download", bot.name, fn),
+      );
     },
     usage: () => usage(cdp()),
     // Routine names, prompts, the Bot's reply and its error text all come from the Bot's side.
-    routines: async (p) => ({ ...((await routines(cdp(), p, (text) => opts.jobs?.checkPolicy(text))) as object), untrusted: true }),
+    routines: async (p) => {
+      const bot = typeof p.bot === "string" ? p.bot : "The Bot";
+      const go = () => routines(cdp(), p, (text) => opts.jobs?.checkPolicy(text));
+      // list and run only read the app's store, so they can be retried; the others send the Bot a message.
+      const result = ["list", "run"].includes(String(p.action)) ? await waker.attempt("routines", bot, go) : await asleepAs(bot, go);
+      return { ...(result as object), untrusted: true };
+    },
     createBot: (p) => {
       const { str, optStr } = reader(p);
-      return createBot(cdp(), { name: str("name"), description: optStr("description") });
+      return asleepAs(str("name"), () => createBot(cdp(), { name: str("name"), description: optStr("description") }));
     },
     updateBot: (p) => {
       const { str, optStr } = reader(p);
@@ -218,7 +330,7 @@ export function daemonMethods(
       const description = optStr("description");
       if (name === undefined && description === undefined)
         throw new ProtocolError("bad_request", 'Pass "name" or "description" to change.');
-      return updateBot(cdp(), str("bot"), { name, description });
+      return asleepAs(str("bot"), () => updateBot(cdp(), str("bot"), { name, description }));
     },
     deleteBot: (p) => {
       const { str } = reader(p);
@@ -226,6 +338,15 @@ export function daemonMethods(
       return deleteBot(cdp(), str("bot"));
     },
   };
+}
+
+/**
+ * An error message's first line, for daemon.log: at most 200 characters. Error messages name Bots, files and rules;
+ * they never carry Bot replies or file contents.
+ */
+export function logLine(message: string): string {
+  const first = message.split("\n")[0].trim();
+  return first.length > 200 ? `${first.slice(0, 200)}…` : first;
 }
 
 function tokenMatches(given: unknown, key: Buffer): boolean {
@@ -277,11 +398,23 @@ function serve(socket: Socket, key: Buffer, methods: Methods, log: Log): void {
     if (typeof params !== "object" || Array.isArray(params)) return fail(id, "bad_request", "params must be an object.");
     try {
       reply({ id, result: await methods[method](params as Record<string, unknown>) });
-    } catch (e) {
+    } catch (thrown) {
+      // An asleep failure nobody mapped (a Bot name isn't known here) is still bot_asleep, never internal.
+      const e = !(thrown instanceof ProtocolError) && isAsleep(thrown) ? new BotAsleepError("The Bot") : thrown;
       const code = e instanceof ProtocolError ? e.code : "internal";
-      log(`${method} failed (${code})`);
+      const message = String((e as Error)?.message ?? e);
       const rule = e instanceof ProtocolError ? (e as { rule?: unknown }).rule : undefined;
-      reply({ id, error: { code, message: (e as Error).message, ...(typeof rule === "string" ? { rule } : {}) } });
+      const retryAfterSec = e instanceof ProtocolError ? (e as { retryAfterSec?: unknown }).retryAfterSec : undefined;
+      log(`${method} failed (${code}${typeof rule === "string" ? `, rule ${rule}` : ""}): ${logLine(message)}`);
+      reply({
+        id,
+        error: {
+          code,
+          message,
+          ...(typeof rule === "string" ? { rule } : {}),
+          ...(typeof retryAfterSec === "number" ? { retryAfterSec } : {}),
+        },
+      });
     }
   }
 

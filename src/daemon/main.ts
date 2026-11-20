@@ -18,7 +18,7 @@ const jobs = new Jobs({ dir: paths.jobs, events, layer: baseLayer(transport), li
 const selftest = new SelfTest({ home: paths.home, cdp: () => transport.requireCdp(), log });
 
 let server: Awaited<ReturnType<typeof startServer>>;
-const methods = daemonMethods(transport, { jobs, events, selftest });
+const methods = daemonMethods(transport, { jobs, events, selftest, log });
 const listen = () => startServer({ socketPath: paths.socket, token, methods, log });
 try {
   server = await listen();

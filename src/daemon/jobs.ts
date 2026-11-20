@@ -213,8 +213,19 @@ const under = (p: string, dir: string) => p === dir || p.startsWith(dir + sep);
  * Both the path as given and its real path (after symlinks) are checked. With `attach-roots.json` in the state
  * folder (an array of absolute folders), only files under those folders are allowed.
  */
+/** Which attachment rule refused a file: `rule` on the file_blocked error and in daemon.log. */
+export type AttachmentRule = "credential_folder" | "secret_name" | "attach_roots";
+
 export function checkAttachment(file: string, opts: { home: string; stateHome: string }): void {
-  const blocked = (why: string) => new ProtocolError("file_blocked", `Grok Link won't attach ${file}: ${why}. Nothing was sent.`);
+  // Names the file by its basename and the rule that matched, so the agent and the log can tell what happened.
+  const blocked = (rule: AttachmentRule, what: string) =>
+    Object.assign(
+      new ProtocolError(
+        "file_blocked",
+        `Attachment ${basename(file)} ${what} (rule ${rule}); Grok Link won't send it. Don't retry with the same file or a renamed copy. Nothing was sent.`,
+      ),
+      { rule },
+    );
   let real: string;
   try {
     real = realpathSync.native(file);
@@ -230,8 +241,8 @@ export function checkAttachment(file: string, opts: { home: string; stateHome: s
       return [resolve(full), join(realOr(dirname(full)), basename(full))].some((c) => p.startsWith(c));
     });
     if (dirs.some((d) => under(p, d)) || homeFiles.includes(p) || prefixed)
-      throw blocked("it's in a folder that holds keys or credentials");
-    if (SENSITIVE_NAMES.some((re) => re.test(basename(p)))) throw blocked("its name marks it as a key or secrets file");
+      throw blocked("credential_folder", "is in a folder that holds keys or credentials");
+    if (SENSITIVE_NAMES.some((re) => re.test(basename(p)))) throw blocked("secret_name", "is a credential file by its name");
   }
   const rootsFile = join(opts.stateHome, "attach-roots.json");
   if (!existsSync(rootsFile)) return;
@@ -239,11 +250,12 @@ export function checkAttachment(file: string, opts: { home: string; stateHome: s
   try {
     roots = JSON.parse(readFileSync(rootsFile, "utf8"));
   } catch {
-    throw blocked(`${rootsFile} isn't valid JSON, so no file can be checked against it`);
+    throw blocked("attach_roots", `can't be checked: ${basename(rootsFile)} isn't valid JSON`);
   }
   if (!Array.isArray(roots) || roots.some((r) => typeof r !== "string" || !isAbsolute(r)))
-    throw blocked(`${rootsFile} must be an array of absolute folder paths`);
-  if (!roots.some((r) => under(real, realOr(r as string)))) throw blocked(`it's outside the folders listed in ${rootsFile}`);
+    throw blocked("attach_roots", `can't be checked: ${basename(rootsFile)} must be an array of absolute folder paths`);
+  if (!roots.some((r) => under(real, realOr(r as string))))
+    throw blocked("attach_roots", `is outside the folders listed in ${basename(rootsFile)}`);
 }
 
 /** Attached files whose text the policy also reads. */

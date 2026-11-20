@@ -212,6 +212,8 @@ If the self-test fails, `groklink_task` refuses to send and names the failed che
 
 ## Troubleshooting
 
+**`bot_asleep`.** Grok Bot puts a Bot's computer to sleep when its window has been in the background for 10 minutes. Reading a conversation, downloading files and listing or running routines need it awake. When one of those calls hits an asleep Bot, Grok Link brings the Grok Bot window to the front once (at most once a minute per Bot, since it takes focus), waits up to 15 s and retries. If the Bot is still asleep, the call fails with `bot_asleep` and `retryAfterSec: 10`: bring Grok Bot to the front yourself and try again. `daemon.log` shows each failed call as `<method> failed (<code>): <reason>`, plus `woke <bot> for <method>` or `wake failed`.
+
 **Closing the Grok Bot window or using another Grok Bot bridge.** If you close the Grok Bot window (Cmd+W), the app keeps running without it, and Grok Link reopens it as a Dock click would. If the window doesn't come back, Grok Link restarts the app. Running jobs carry on either way. Don't run Grok Link next to the old [grokbot-bridge](https://github.com/TheSethRose/grokbot-bridge): each one restarts Grok Bot in its own mode, so they keep quitting each other's copy of the app. That's why `groklink install` refuses while grokbot-bridge is registered.
 
 **`file_blocked` or `dir_blocked`.** The file you asked to attach, or the folder you asked to save into, is one Grok Link protects (see Security model). Attach a copy from another folder, or save under `~/.groklink/downloads` or `~/Downloads/groklink` (or a folder in `~/.groklink/download-roots.json`).

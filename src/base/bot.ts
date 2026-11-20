@@ -578,23 +578,26 @@ export async function download(
   keys: string[],
   outDir = ".",
   verifyDir?: (realDir: string) => void,
+  /** Wraps each read from the app (the conversation, then each file), e.g. to wake an asleep Bot and retry that read. */
+  attempt: <T>(fn: () => Promise<T>) => Promise<T> = (fn) => fn(),
 ): Promise<{ bot: string; files: Download[] }> {
-  const { bot, messages } = await read(cdp, botQuery, { limit: 1000 });
+  const { bot, messages } = await attempt(() => read(cdp, botQuery, { limit: 1000 }));
   const id = (await findBot(cdp, bot)).id;
   const withFiles = messages.filter((m) => m.file);
   const picked = keys.length
     ? keys.map((k) => {
         const m = messages.find((x) => x.key === k);
-        if (!m) throw new Error(`No message with key ${k} in ${bot}'s conversation.`);
-        if (!m.file) throw new Error(`Message ${k} has no file.`);
+        if (!m) throw new ProtocolError("not_found", `No message with key ${k} in ${bot}'s conversation.`);
+        if (!m.file) throw new ProtocolError("bad_request", `Message ${k} has no file.`);
         return m;
       })
     : withFiles.filter((m) => m.role === "assistant").slice(-1);
-  if (!picked.length) throw new Error(`${bot} hasn't sent any files.`);
+  if (!picked.length) throw new ProtocolError("no_files", `${bot} hasn't sent any files.`);
   const files: Download[] = [];
   for (const m of picked) {
     const file = m.file as { name: string; path: string };
-    const data = Buffer.from(await cdp.call<string>(PAGE_DOWNLOAD, id, file.path, MAX_DOWNLOAD_BYTES), "base64");
+    const raw = await attempt(() => cdp.call<string>(PAGE_DOWNLOAD, id, file.path, MAX_DOWNLOAD_BYTES));
+    const data = Buffer.from(raw, "base64");
     const savedTo = await writeNew(resolve(outDir), safeFileName(file.name), data, verifyDir);
     files.push({ name: file.name, from: file.path, savedTo, bytes: data.length });
   }

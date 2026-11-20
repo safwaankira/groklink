@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.6
+
+- **Asleep Bots aren't "internal" errors any more.** A call that needs the Bot's computer while Grok Bot has parked it now fails with the new code `bot_asleep` and `retryAfterSec: 10`: "<Bot>'s computer is asleep. Bring the Grok Bot window to the front, then try again in ~10 s."
+- **One automatic wake.** Before failing, `read`, `download` and routine `list`/`run` bring the Grok Bot window to the front once (at most once per 60 s per Bot), wait up to 15 s for the computer to wake, and retry once. Routine changes that message the Bot are never retried.
+- **`no_files`** when a Bot hasn't sent any files to download (was `internal`).
+- **Clearer `file_blocked`.** The message names the attachment's file name and the rule (`credential_folder`, `secret_name` or `attach_roots`), and the error carries `rule`.
+- **Daemon log.** Every failed call logs `<method> failed (<code>[, rule <rule>]): <first line of the message>`, plus `woke <bot> for <method>` or `wake failed`. Never Bot text or file contents.
+- Tool descriptions and the skill say what to do on `bot_asleep` (retry once after `retryAfterSec`, never loop) and `file_blocked` (don't retry with the same or a renamed file).
+
 ## 0.1.5
 
 - **Posting to X has three modes.** `x_write` in `policy.json` is `block` (default, as before), `approve` or `allow`. Old files keep working: `true` is `block`, `false` is `allow`, and an unknown value is `block` with a warning.
