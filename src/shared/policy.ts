@@ -1,14 +1,34 @@
 // Safety policy: refuse briefs that ask a Bot to write on X, sign or send transactions, connect a wallet or submit claims.
 // tx, wallet and claim are on unless policy.json sets them to false. x_write has a mode: block (default), approve (the
 // user approves each posting task in a dialog on their Mac) or allow. There's no per-call override.
-import { lstatSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { ProtocolError } from "./protocol.ts";
 
 export const RULES = ["x_write", "tx", "wallet", "claim"] as const;
 export type Rule = (typeof RULES)[number];
 export type PolicyResult = { ok: true } | { ok: false; rule: Rule };
 
-const DEFAULT_FILE = '{ "x_write": "block", "tx": true, "wallet": true, "claim": true }\n';
+const DEFAULT_FILE = '{ "x_write": "block", "tx": true, "wallet": true, "claim": true, "usage": { "warn": 80, "pause": 100 } }\n';
+
+/** Percent of weekly Grok usage at which health warns, and at which new tasks are refused (100 = only when used up). */
+export type UsageLimits = { warn: number; pause: number };
+export const DEFAULT_USAGE: UsageLimits = { warn: 80, pause: 100 };
+export const USAGE_WARNING = `policy.json has invalid usage limits; using warn ${DEFAULT_USAGE.warn}, pause ${DEFAULT_USAGE.pause}. Use numbers: warn 0-100, pause 1-100, warn no higher than pause.`;
+
+/**
+ * The usage limits in a parsed policy file. A missing `usage` key (or a missing number in it) means the defaults.
+ * Anything invalid (not numbers, out of range, warn above pause) means both defaults, with a warning.
+ */
+export function usageLimits(parsed: unknown): UsageLimits & { warning?: string } {
+  const v = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>).usage : undefined;
+  if (v === undefined) return { ...DEFAULT_USAGE };
+  const bad = { ...DEFAULT_USAGE, warning: USAGE_WARNING };
+  if (!v || typeof v !== "object" || Array.isArray(v)) return bad;
+  const { warn = DEFAULT_USAGE.warn, pause = DEFAULT_USAGE.pause } = v as Record<string, unknown>;
+  const num = (n: unknown, min: number): n is number => typeof n === "number" && Number.isFinite(n) && n >= min && n <= 100;
+  return num(warn, 0) && num(pause, 1) && warn <= pause ? { warn, pause } : bad;
+}
 
 export const X_MODES = ["block", "approve", "allow"] as const;
 export type XMode = (typeof X_MODES)[number];
@@ -128,22 +148,35 @@ export function policyFileError(file: string): string | null {
 }
 
 /**
- * Set x_write's mode in the policy file, keeping the other keys: written to a temp file (0600) and renamed over the old
- * one. A missing file starts from the defaults. A file that exists but can't be read or parsed is never replaced (its
- * other settings would be lost): this throws instead.
+ * Change the policy file, keeping its other keys: written to a temp file (0600) and renamed over the old one. A missing
+ * file starts from the defaults. A file that exists but can't be read or parsed is never replaced (its other settings
+ * would be lost): this throws instead.
  */
-export function writeXMode(file: string, mode: XMode, rename: (from: string, to: string) => void = renameSync): Record<string, unknown> {
+function writePolicy(
+  file: string,
+  change: (base: Record<string, unknown>) => Record<string, unknown>,
+  rename: (from: string, to: string) => void,
+): Record<string, unknown> {
   const broken = policyFileError(file);
   if (broken) throw new Error(`${file} can't be read (${broken}). Fix or delete it first; nothing was changed.`);
   const parsed = loadPolicy(file);
   const base: Record<string, unknown> =
     parsed && typeof parsed === "object" && !Array.isArray(parsed) ? { ...(parsed as Record<string, unknown>) } : JSON.parse(DEFAULT_FILE);
-  const next = { ...base, x_write: mode };
-  // A symlinked policy.json is written through: the link stays, and the file it points to gets the new content.
+  const next = change(base);
+  // A symlinked policy.json is written through: the link stays, and the file it points to gets the new content. A
+  // dangling link is followed too (its target is created), so the link is never replaced by a plain file.
   let target = file;
-  try {
-    if (lstatSync(file).isSymbolicLink()) target = realpathSync(file);
-  } catch {}
+  for (let hops = 0; hops < 20; hops++) {
+    let link: string;
+    try {
+      if (!lstatSync(target).isSymbolicLink()) break;
+      link = readlinkSync(target);
+    } catch {
+      break;
+    }
+    target = resolve(dirname(target), link);
+  }
+  if (target !== file) mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
   const tmp = `${target}.tmp-${process.pid}`;
   try {
     writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
@@ -154,6 +187,40 @@ export function writeXMode(file: string, mode: XMode, rename: (from: string, to:
     throw e;
   }
   return next;
+}
+
+/** Set x_write's mode in the policy file (see `writePolicy`). */
+export function writeXMode(file: string, mode: XMode, rename: (from: string, to: string) => void = renameSync): Record<string, unknown> {
+  return writePolicy(file, (base) => ({ ...base, x_write: mode }), rename);
+}
+
+/**
+ * Set one usage limit in the policy file (see `writePolicy`), keeping the other. `warn` is a whole number 0-100,
+ * `pause` 1-100, and warn may not end up above pause: otherwise this throws and nothing is changed.
+ */
+export function writeUsageLimit(
+  file: string,
+  key: keyof UsageLimits,
+  value: number,
+  rename: (from: string, to: string) => void = renameSync,
+): UsageLimits {
+  const min = key === "warn" ? 0 : 1;
+  if (!Number.isInteger(value) || value < min || value > 100) throw new RangeError(`${key} must be a whole number from ${min} to 100.`);
+  let out: UsageLimits = DEFAULT_USAGE;
+  writePolicy(
+    file,
+    (base) => {
+      const { warn, pause } = usageLimits(base);
+      out = { warn, pause, [key]: value };
+      if (out.warn > out.pause)
+        throw new RangeError(
+          `warn (${out.warn}) can't be higher than pause (${out.pause}). Change ${key === "warn" ? "pause" : "warn"} first; nothing was changed.`,
+        );
+      return { ...base, usage: out };
+    },
+    rename,
+  );
+  return out;
 }
 
 export class PolicyError extends ProtocolError {

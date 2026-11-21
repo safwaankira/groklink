@@ -10,7 +10,7 @@ import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } 
 import { promisify } from "node:util";
 import { ProtocolError } from "../shared/protocol.ts";
 import type { CDP } from "./cdp.ts";
-import { ACCOUNT_SLOT, PAGE_ERROR, store } from "./page.ts";
+import { ACCOUNT_SLOT, PAGE_ERROR, PAGE_PARKED, type Parked, parkable, store, unparked } from "./page.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -52,6 +52,9 @@ const LIB = `
   const transcript = ${store("transcript", "snapshotsFor")};
   if (!roster || !transcript) throw new Error("Couldn't reach Grok Bot's conversations. Is the app signed in and showing its main window? This app version may also have changed.");
   const errorText = ${PAGE_ERROR};
+  const parked = ${PAGE_PARKED};
+  // An error for a failed app call; tagged when the app says the Bot's computer is parked (see parkable in page.ts).
+  const fail = (text, e) => { const err = new Error(text + errorText(e)); const why = parked(e); if (why) err.groklinkAsleep = why; return err; };
   const pause = (ms) => new Promise((r) => setTimeout(r, ms));
   const rows = () => roster.snapshots.get().agents.rows.filter((r) => !r.isGroup);
   const rowOf = (id) => roster.snapshots.get().agentsById.get(id);
@@ -93,7 +96,7 @@ const LIB = `
       if (snap(id).loadState !== "ready") transcript.load(id);
       for (const t0 = Date.now(); snap(id).loadState !== "ready"; await pause(150)) {
         const s = snap(id);
-        if (s.failure) throw new Error("Couldn't load the conversation: " + errorText(s.failure));
+        if (s.failure) throw fail("Couldn't load the conversation: ", s.failure);
         if (Date.now() - t0 > 20000) throw new Error("Timed out loading the conversation (" + s.loadState + ").");
       }
     } catch (e) { release(); throw e; }
@@ -109,10 +112,19 @@ const LIB = `
 `;
 
 const page = (args: string, body: string) => `async (${args}) => {${LIB}\n${body}\n}`;
+/** A page function whose callers check for a parked computer with `unparked`. */
+const parkablePage = (args: string, body: string) => parkable(page(args, body));
+/** For tests: the page-side source of each function that reports a parked computer. */
+export const PARKABLE_PAGES = (): Record<string, string> => ({
+  read: PAGE_READ,
+  send: PAGE_SEND,
+  stop: PAGE_STOP,
+  download: PAGE_DOWNLOAD,
+});
 
 const PAGE_BOTS = page("", "return rows().map(toBot);");
 
-const PAGE_READ = page(
+const PAGE_READ = parkablePage(
   "id, limit, since",
   `const release = await open(id);
   try {
@@ -129,7 +141,7 @@ const PAGE_READ = page(
 );
 
 // Same path as the message box: stage files, then queue the prompt with the app's send journal.
-const PAGE_SEND = page(
+const PAGE_SEND = parkablePage(
   "id, prompt, uploads",
   `const journal = ${store("sendJournal", "sendPrompt")};
   const stager = ${store("desktop", "stageAttachmentFile")};
@@ -142,13 +154,13 @@ const PAGE_SEND = page(
       const bytes = Uint8Array.from(atob(f.data), (c) => c.charCodeAt(0));
       const blob = new Blob([bytes], { type: f.type });
       const staged = stager ? await stager.stageAttachmentFile({ filename: f.name, file: blob }) : await window.desktop.local.stageAttachmentFile(f.name, blob);
-      if (!staged || !staged.ok) throw new Error("Grok Bot wouldn't accept " + f.name + ": " + errorText((staged && (staged.error || staged.reason)) || "staging failed"));
+      if (!staged || !staged.ok) throw fail("Grok Bot wouldn't accept " + f.name + ": ", (staged && (staged.error || staged.reason)) || "staging failed");
       attachments.push({ path: staged.path, name: f.name, size: bytes.length });
     }
     let nonce = null;
     try {
       await journal.sendPrompt({ agentId: id, prompt, attachments, onNonceAssigned: (n) => { nonce = n.nonce; } });
-    } catch (e) { throw new Error("Grok Bot didn't send the message: " + errorText(e)); }
+    } catch (e) { throw fail("Grok Bot didn't send the message: ", e); }
     for (let n = 0; n < 50; n++) {
       const entry = snap(id).entries.find((e) => e.clientNonce === nonce);
       if (entry) return entry.clientNonce;
@@ -258,7 +270,7 @@ const PAGE_WATCH = page(
 );
 
 // Same as the app's Stop button: interrupt every running session of the Bot.
-const PAGE_STOP = page(
+const PAGE_STOP = parkablePage(
   "id",
   `const row = rowOf(id);
   if (!busy(row)) return false;
@@ -266,19 +278,19 @@ const PAGE_STOP = page(
   try {
     if (!sessions.length) await roster.interruptAgentRun({ agentId: id });
     else await Promise.allSettled(sessions.map((s) => roster.interruptAgentRun({ agentId: id, sessionId: s })));
-  } catch (e) { throw new Error("Grok Bot couldn't stop the Bot: " + errorText(e)); }
+  } catch (e) { throw fail("Grok Bot couldn't stop the Bot: ", e); }
   return true;`,
 );
 
 // Reads a file from the Bot's computer the way the app's file previews do. Bytes come back as base64.
-const PAGE_DOWNLOAD = page(
+const PAGE_DOWNLOAD = parkablePage(
   "id, path, maxBytes",
   `const files = ${store("desktop", "readAttachmentBytes")};
   const slot = ${ACCOUNT_SLOT};
   if (!files || !slot) throw new Error("Couldn't reach Grok Bot's file reader. This app version may not support it.");
   let r;
   try { r = await files.readAttachmentBytes({ path, agentId: id, maxBytes, viewSlot: slot }); }
-  catch (e) { throw new Error("Couldn't read " + path + " from the Bot's computer: " + errorText(e)); }
+  catch (e) { throw fail("Couldn't read " + path + " from the Bot's computer: ", e); }
   if (!r || r.kind !== "bytes") throw new Error("Couldn't read " + path + (r && r.kind ? " (" + r.kind + ")" : ""));
   const bytes = r.bytes instanceof Uint8Array ? r.bytes : new Uint8Array(r.bytes);
   let bin = "";
@@ -319,7 +331,7 @@ export async function findBot(cdp: CDP, query: string): Promise<Bot> {
 export async function read(cdp: CDP, botQuery: string, opts: { limit?: number; since?: string } = {}) {
   const bot = await findBot(cdp, botQuery);
   const limit = opts.limit ?? (opts.since ? 0 : 10);
-  const messages = await cdp.call<Message[]>(PAGE_READ, bot.id, limit, opts.since ?? null);
+  const messages = unparked(await cdp.call<Message[] | Parked>(PAGE_READ, bot.id, limit, opts.since ?? null), bot.name);
   return { bot: bot.name, messages };
 }
 
@@ -355,7 +367,7 @@ async function loadFiles(paths: string[]) {
 export async function send(cdp: CDP, botQuery: string, text: string, files: string[] = []): Promise<{ bot: string; key: string }> {
   if (!text.trim() && !files.length) throw new Error("Message is empty.");
   const bot = await findBot(cdp, botQuery);
-  const key = await cdp.call<string>(PAGE_SEND, bot.id, text.trim(), await loadFiles(files));
+  const key = unparked(await cdp.call<string | Parked>(PAGE_SEND, bot.id, text.trim(), await loadFiles(files)), bot.name);
   return { bot: bot.name, key };
 }
 
@@ -422,7 +434,7 @@ export async function watch(cdp: CDP, botQuery: string | null, onEvent: (e: BotE
 /** Interrupt what a Bot is doing, like the Stop button. Returns false if it wasn't working. */
 export async function stop(cdp: CDP, botQuery: string): Promise<{ bot: string; stopped: boolean }> {
   const bot = await findBot(cdp, botQuery);
-  return { bot: bot.name, stopped: await cdp.call<boolean>(PAGE_STOP, bot.id) };
+  return { bot: bot.name, stopped: unparked(await cdp.call<boolean | Parked>(PAGE_STOP, bot.id), bot.name) };
 }
 
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
@@ -567,10 +579,21 @@ async function writeNew(dir: string, name: string, data: Buffer, verify?: (realD
 }
 
 export type Download = { name: string; from: string; savedTo: string; bytes: number };
+/**
+ * `partial` is set when some files were saved and a later one failed: `files` lists what was saved (don't download
+ * those again) and `error` says why the rest wasn't.
+ */
+export type DownloadResult = {
+  bot: string;
+  files: Download[];
+  partial?: true;
+  error?: { code: string; message: string; retryAfterSec?: number; failedKey: string };
+};
 
 /**
  * Save files from a conversation to `outDir`. `keys` picks file messages; with none, saves the
- * newest file the Bot sent. Existing local files are never overwritten.
+ * newest file the Bot sent. Existing local files are never overwritten. If a file fails after others
+ * were saved, the saved ones are returned with the error (`partial: true`) instead of throwing.
  */
 export async function download(
   cdp: CDP,
@@ -580,7 +603,7 @@ export async function download(
   verifyDir?: (realDir: string) => void,
   /** Wraps each read from the app (the conversation, then each file), e.g. to wake an asleep Bot and retry that read. */
   attempt: <T>(fn: () => Promise<T>) => Promise<T> = (fn) => fn(),
-): Promise<{ bot: string; files: Download[] }> {
+): Promise<DownloadResult> {
   const { bot, messages } = await attempt(() => read(cdp, botQuery, { limit: 1000 }));
   const id = (await findBot(cdp, bot)).id;
   const withFiles = messages.filter((m) => m.file);
@@ -596,10 +619,29 @@ export async function download(
   const files: Download[] = [];
   for (const m of picked) {
     const file = m.file as { name: string; path: string };
-    const raw = await attempt(() => cdp.call<string>(PAGE_DOWNLOAD, id, file.path, MAX_DOWNLOAD_BYTES));
-    const data = Buffer.from(raw, "base64");
-    const savedTo = await writeNew(resolve(outDir), safeFileName(file.name), data, verifyDir);
-    files.push({ name: file.name, from: file.path, savedTo, bytes: data.length });
+    try {
+      const raw = await attempt(async () =>
+        unparked(await cdp.call<string | Parked>(PAGE_DOWNLOAD, id, file.path, MAX_DOWNLOAD_BYTES), bot),
+      );
+      const data = Buffer.from(raw, "base64");
+      const savedTo = await writeNew(resolve(outDir), safeFileName(file.name), data, verifyDir);
+      files.push({ name: file.name, from: file.path, savedTo, bytes: data.length });
+    } catch (e) {
+      // Nothing saved yet: fail as before. Otherwise the caller must learn what was saved.
+      if (!files.length) throw e;
+      const retryAfterSec = (e as { retryAfterSec?: unknown }).retryAfterSec;
+      return {
+        bot,
+        files,
+        partial: true,
+        error: {
+          code: e instanceof ProtocolError ? e.code : "internal",
+          message: String((e as Error)?.message ?? e),
+          ...(typeof retryAfterSec === "number" ? { retryAfterSec } : {}),
+          failedKey: m.key,
+        },
+      };
+    }
   }
   return { bot, files };
 }

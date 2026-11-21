@@ -108,7 +108,10 @@ test("a missing or broken file, or missing keys, keep every rule on", () => {
 test("ensurePolicy writes the default file (0600) once and keeps an edited one", () => {
   const file = join(home, "policy.json");
   ensurePolicy(file);
-  assert.equal(readFileSync(file, "utf8"), '{ "x_write": "block", "tx": true, "wallet": true, "claim": true }\n');
+  assert.equal(
+    readFileSync(file, "utf8"),
+    '{ "x_write": "block", "tx": true, "wallet": true, "claim": true, "usage": { "warn": 80, "pause": 100 } }\n',
+  );
   assert.equal(statSync(file).mode & 0o777, 0o600);
   writeFileSync(file, '{ "tx": false }');
   ensurePolicy(file);

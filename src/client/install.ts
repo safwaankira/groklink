@@ -58,7 +58,16 @@ export function defaultEnv(): InstallEnv {
   };
 }
 
-export type Options = { dryRun?: boolean; replaceGrokbotBridge?: boolean };
+/** Why install stopped without finishing. */
+export type InstallFailure = "grokbot_bridge" | "desktop_running" | "launchctl" | "not_connected";
+export type Options = {
+  dryRun?: boolean;
+  replaceGrokbotBridge?: boolean;
+  /** Don't reload a LaunchAgent that's already written as this run would write it and whose daemon answers (`groklink setup`). */
+  keepRunning?: boolean;
+  /** Told why, when install returns 1. */
+  onFail?: (why: InstallFailure) => void;
+};
 
 const SKILL = join("skills", "groklink", "SKILL.md");
 
@@ -345,7 +354,7 @@ ${envXml}</dict>
 `;
 }
 
-async function waitConnected(env: InstallEnv): Promise<Health | null> {
+export async function waitConnected(env: InstallEnv): Promise<Health | null> {
   const deadline = Date.now() + (env.waitMs ?? WAIT_MS);
   for (;;) {
     try {
@@ -399,6 +408,8 @@ export async function install(env: InstallEnv, opts: Options = {}): Promise<numb
   const register = registrations(env, w);
   const busy = desktopBusy(env, found.some((c) => c.client === DESKTOP) || register.some((s) => s.client === DESKTOP));
   if (busy) env.out(QUIT_DESKTOP);
+  if (blocked) opts.onFail?.("grokbot_bridge");
+  else if (busy) opts.onFail?.("desktop_running");
   if (blocked || (busy && !opts.dryRun)) return 1;
   const launchAgent = `write ${p.plist} and load it with launchctl (gui/${env.uid}/${LABEL})`;
   if (opts.dryRun) {
@@ -414,8 +425,18 @@ export async function install(env: InstallEnv, opts: Options = {}): Promise<numb
     );
   // The LaunchAgent goes first: if it fails, no client config has been touched.
   mkdirSync(env.stateHome, { recursive: true, mode: 0o700 });
-  w.write(p.plist, plist(env));
-  if (!(await loadAgent(env, p.plist))) {
+  const agent = plist(env);
+  const running =
+    opts.keepRunning === true &&
+    existsSync(p.plist) &&
+    readFileSync(p.plist, "utf8") === agent &&
+    (await env.health().then(
+      () => true,
+      () => false,
+    ));
+  if (!running) w.write(p.plist, agent);
+  if (!running && !(await loadAgent(env, p.plist))) {
+    opts.onFail?.("launchctl");
     env.out(
       `launchctl bootstrap failed for ${p.plist} (tried twice). No client config was changed. See ${join(env.stateHome, "daemon.log")}.`,
     );
@@ -423,6 +444,7 @@ export async function install(env: InstallEnv, opts: Options = {}): Promise<numb
   }
   const h = await waitConnected(env);
   if (!h) {
+    opts.onFail?.("not_connected");
     env.out(
       `The daemon didn't connect to Grok Bot within ${(env.waitMs ?? WAIT_MS) / 1000} s. No client config was changed. See ${join(env.stateHome, "daemon.log")}.`,
     );

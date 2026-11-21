@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.7
+
+- **Usage guard.** `policy.json` takes `"usage": { "warn": 80, "pause": 100 }` (percent of weekly Grok usage used; those are the defaults). From `warn`, `groklink_health` warns "Grok usage is at N% (warn at W%)." and `groklink doctor` shows the usage line as `!`. From `pause` (when below 100), new tasks and routine runs are refused with the new code `usage_paused`, and nothing is sent; running jobs aren't stopped. `pause: 100` keeps the old behaviour. Files without the key use the defaults; invalid values use the defaults too, with a health warning.
+- **`groklink policy usage`** shows the two numbers; `groklink policy usage warn <0-100>` and `groklink policy usage pause <1-100>` rewrite `policy.json` (0600, atomic) and restart the daemon. CLI only.
+- **`groklink setup`.** One command for first use: installs the LaunchAgent and registers your MCP clients, adds the agent skill (an existing copy is kept), waits for the daemon and runs doctor, printing one `✓`/`✗` line per step. A failed step says how to fix it and exits 1. It never sends a Bot message, is safe to run again, and has `--dry-run`. The quick start is now `npm i -g groklink`, then `groklink setup`.
+- **Approval dialog.** The Bot's name is shown only if it's plain text (the same rule as the brief, one line, at most 60 characters); otherwise the dialog shows the Bot's id. Approve mode now accepts skin-tone emoji, flags and keycaps, and refuses code points that aren't assigned yet.
+- **`groklink policy` and a dangling symlink.** A symlinked `policy.json` whose target doesn't exist yet is written through (the target is created); the link is no longer replaced by a file.
+- **Daemon log.** A failed call logs its message only for Grok Link's own errors. Errors that come from the app or a Bot's side (routine names, the app's error text) log the code alone.
+- **Partial downloads.** If a file fails after others were saved, `groklink_download` returns the saved files with `partial: true` and an `error` (code, message, `failedKey`) instead of failing the whole call.
+- **`file_blocked` through a link.** When only a link's target is protected, the message names the link and says it points to a blocked location; the target isn't named.
+- **Asleep detection.** `bot_asleep` now comes from the app's own failure code, never from message text, so a routine or file whose name mentions sleep can't trigger a wake. Sending and stopping report `bot_asleep` too. The once-a-minute wake limit follows the Bot's id, whatever name a call uses.
+- **Docs.** The README opens with what Grok Link is and the two-line quick start, and has a Questions section. `llms.txt` (shipped in the package) lists the tools and what an agent should do for each error code.
+
 ## 0.1.6
 
 - **Asleep Bots aren't "internal" errors any more.** A call that needs the Bot's computer while Grok Bot has parked it now fails with the new code `bot_asleep` and `retryAfterSec: 10`: "<Bot>'s computer is asleep. Bring the Grok Bot window to the front, then try again in ~10 s."

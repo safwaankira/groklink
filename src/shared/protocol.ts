@@ -27,6 +27,7 @@ export const ERROR_CODES = [
   "schema_invalid",
   "no_reply",
   "usage_exhausted",
+  "usage_paused",
   "file_blocked",
   "dir_blocked",
   "bot_asleep",

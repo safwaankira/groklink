@@ -7,7 +7,18 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { findBot, type Message, read, send, type Usage, usage, type WaitResult, wait } from "../base/bot.ts";
 import type { CDP } from "../base/cdp.ts";
 import { BOX_PHASE } from "../base/page.ts";
-import { ensurePolicy, loadPolicy, matches, PolicyError, RULES, type Rule, type XMode, xMode } from "../shared/policy.ts";
+import {
+  ensurePolicy,
+  loadPolicy,
+  matches,
+  PolicyError,
+  RULES,
+  type Rule,
+  type UsageLimits,
+  usageLimits,
+  type XMode,
+  xMode,
+} from "../shared/policy.ts";
 import { type ErrorCode, ProtocolError, type RpcError } from "../shared/protocol.ts";
 import { lastJsonBlock, type Schema, validate } from "../shared/schema.ts";
 import { Approvals, approvalTextProblem, type Decision, duration, MAX_APPROVAL_BRIEF, type Slot } from "./approval.ts";
@@ -124,6 +135,12 @@ export function usageOut(u: Usage): boolean {
 const usageMessage = (u: Usage, tail: string) =>
   `Grok Bot weekly usage is used up (${Math.floor(u.percentUsed)}%). It resets at ${u.resetsAt ?? "an unknown time"}. Enable on-demand usage in Grok Bot to continue sooner. ${tail}`;
 
+const usagePausedMessage = (u: Usage, pause: number) =>
+  `Grok usage is at ${Math.floor(u.percentUsed)}%; new tasks pause at ${pause}% (your setting). It resets at ${u.resetsAt ?? "an unknown time"}. Nothing was sent.`;
+
+/** The health warning once usage reaches the user's `warn` percent. */
+export const usageWarning = (percentUsed: number, warn: number) => `Grok usage is at ${Math.floor(percentUsed)}% (warn at ${warn}%).`;
+
 export type UsageSummary = { percentUsed: number; resetsAt: string | null; out: boolean };
 
 export const SLEEP_WARNING =
@@ -235,15 +252,21 @@ export function checkAttachment(file: string, opts: { home: string; stateHome: s
   const given = resolve(file);
   const dirs = [...SENSITIVE_DIRS.map((d) => join(opts.home, d)), opts.stateHome].flatMap((d) => [resolve(d), realOr(d)]);
   const homeFiles = SENSITIVE_HOME_FILES.map((f) => join(opts.home, f)).flatMap((f) => [resolve(f), realOr(f)]);
-  for (const p of [given, real]) {
+  const why = (p: string): [AttachmentRule, string] | null => {
     const prefixed = SENSITIVE_HOME_PREFIXES.some((f) => {
       const full = join(opts.home, f);
       return [resolve(full), join(realOr(dirname(full)), basename(full))].some((c) => p.startsWith(c));
     });
     if (dirs.some((d) => under(p, d)) || homeFiles.includes(p) || prefixed)
-      throw blocked("credential_folder", "is in a folder that holds keys or credentials");
-    if (SENSITIVE_NAMES.some((re) => re.test(basename(p)))) throw blocked("secret_name", "is a credential file by its name");
-  }
+      return ["credential_folder", "in a folder that holds keys or credentials"];
+    if (SENSITIVE_NAMES.some((re) => re.test(basename(p)))) return ["secret_name", "a credential file by its name"];
+    return null;
+  };
+  const direct = why(given);
+  if (direct) throw blocked(direct[0], `is ${direct[1]}`);
+  // Only the file a link points to is blocked: name the link (what the caller attached), never the target's path.
+  const linked = why(real);
+  if (linked) throw blocked(linked[0], `is a link that points to a blocked location (a file that is ${linked[1]})`);
   const rootsFile = join(opts.stateHome, "attach-roots.json");
   if (!existsSync(rootsFile)) return;
   let roots: unknown;
@@ -481,10 +504,7 @@ export class Jobs {
     schema: unknown,
     slot: Slot | null,
   ): Promise<{ jobId: string; status: JobStatus }> {
-    let u = await this.readUsage();
-    // A cached "out" can be up to usageCacheMs old: confirm with one fresh read before refusing.
-    if (u && usageOut(u)) u = await this.readUsage({ fresh: true });
-    if (u && usageOut(u)) throw new ProtocolError("usage_exhausted", usageMessage(u, "Nothing was sent."));
+    await this.checkUsage();
     const files = params.files ?? [];
     const relative = files.find((f) => !isAbsolute(f));
     if (relative !== undefined) throw new ProtocolError("bad_request", `File paths must be absolute: ${relative}`);
@@ -602,7 +622,7 @@ export class Jobs {
     this.o.log(`job ${job.jobId} needs approval to post to X`);
     void this.o.approvals
       // The dialog shows the brief exactly as it will be sent (approvable made sure normalizing changes nothing).
-      .request({ jobId: job.jobId, bot: job.bot, brief: job.brief }, slot)
+      .request({ jobId: job.jobId, bot: job.bot, botId: job.botId, brief: job.brief }, slot)
       .then((decision) => this.decide(job, decision))
       .catch((e) => {
         this.o.log(`job ${job.jobId} approval failed: ${(e as Error).message}`);
@@ -674,6 +694,34 @@ export class Jobs {
     this.enforce(text, "other");
   }
 
+  /** The usage limits (percent used) as loaded at start: where health warns and where new tasks pause. */
+  usageLimits(): UsageLimits {
+    const { warn, pause } = usageLimits(this.loadedPolicy().parsed);
+    return { warn, pause };
+  }
+
+  /**
+   * Refuse new work (a task, a routine run) when Grok usage is used up (`usage_exhausted`) or has reached the user's
+   * `pause` percent (`usage_paused`). Running jobs are never stopped by `pause`. Usage that can't be read doesn't block.
+   */
+  async checkUsage(): Promise<void> {
+    const { pause } = this.usageLimits();
+    const stop = (u: Usage) => usageOut(u) || (pause < 100 && u.percentUsed >= pause);
+    let u = await this.readUsage();
+    // A cached reading can be up to usageCacheMs old: confirm with one fresh read before refusing.
+    if (u && stop(u)) u = await this.readUsage({ fresh: true });
+    if (!u) return;
+    if (usageOut(u)) throw new ProtocolError("usage_exhausted", usageMessage(u, "Nothing was sent."));
+    if (stop(u)) throw new ProtocolError("usage_paused", usagePausedMessage(u, pause));
+  }
+
+  /** The health warning for the last usage reading, if it has reached the user's `warn` percent. */
+  usageWarnings(): string[] {
+    const u = this.usageCache?.value;
+    const { warn } = this.usageLimits();
+    return u && u.percentUsed >= warn ? [usageWarning(u.percentUsed, warn)] : [];
+  }
+
   /** x_write's mode and the other rules on or off as loaded at start, plus warnings. */
   policyState(): { rules: { x_write: XMode } & Record<Exclude<Rule, "x_write">, boolean>; warnings: string[] } {
     const parsed = this.loadedPolicy().parsed;
@@ -689,6 +737,8 @@ export class Jobs {
     } as { x_write: XMode } & Record<Exclude<Rule, "x_write">, boolean>;
     const warnings: string[] = [];
     if (x.warning) warnings.push(x.warning);
+    const limits = usageLimits(parsed);
+    if (limits.warning) warnings.push(limits.warning);
     if (x.mode === "allow") warnings.push("Posting to X is allowed without approval (x_write: allow).");
     for (const r of RULES) if (r !== "x_write" && !rules[r]) warnings.push(`Safety rule ${r} is off (policy.json).`);
     if (this.policyChanged) warnings.push("policy.json changed; restart groklinkd to apply");

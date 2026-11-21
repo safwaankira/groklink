@@ -2,6 +2,7 @@
 // React context rather than on window, so they're found by walking up the component tree
 // from a rendered element. This is internal to Grok Bot (0.71.x) and may change on app
 // updates; keep the lookups here.
+import { BotAsleepError } from "../shared/protocol.ts";
 
 /** Page-side expression for the first React context value that passes `test` (a JS expression over `v`). Null if none. */
 function contextValue(test: string): string {
@@ -60,3 +61,30 @@ export const PAGE_AWAKE = `async (id, fn) => {
     }
   }
 }`;
+
+/**
+ * Page-side `(e)`: the park reason if an app failure (or a thrown value that carries one) says the app has parked the
+ * Bot's computer, else null. It reads the app's own failure code, never message text.
+ */
+export const PAGE_PARKED = `(e) => {
+  const f = e && (e.failure || e);
+  return f && f.code === "sand-box-blocked" && /PARK/.test(f.sandBoxBlockReason || "") ? String(f.sandBoxBlockReason) : null;
+}`;
+
+/** What a page function returns in place of its result when the Bot's computer is parked. */
+export type Parked = { groklinkAsleep: string };
+
+/**
+ * Wraps a page function so that an error tagged as parked (see `PAGE_PARKED`) comes back as a `Parked` value: an
+ * exception crosses the debug connection as text only, and asleep must never be guessed from text.
+ */
+export const parkable = (fn: string) => `async (...a) => {
+  try { return await (${fn})(...a); }
+  catch (e) { if (e && typeof e.groklinkAsleep === "string") return { groklinkAsleep: e.groklinkAsleep }; throw e; }
+}`;
+
+/** `r`, or a BotAsleepError for `bot` if a `parkable` page function reported the computer parked. */
+export function unparked<T>(r: T | Parked, bot: string): T {
+  if (r && typeof r === "object" && !Array.isArray(r) && typeof (r as Parked).groklinkAsleep === "string") throw new BotAsleepError(bot);
+  return r as T;
+}

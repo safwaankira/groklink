@@ -8,7 +8,7 @@
 import { BotAsleepError } from "../shared/protocol.ts";
 import { ask, findBot, type Message, type WaitOptions, type WaitStatus } from "./bot.ts";
 import type { CDP } from "./cdp.ts";
-import { BOX_PHASE, PAGE_ERROR, store } from "./page.ts";
+import { BOX_PHASE, PAGE_ERROR, PAGE_PARKED, store } from "./page.ts";
 
 export type Routine = {
   id: string;
@@ -63,7 +63,8 @@ const PAGE_ROUTINES = `async (op, id, arg) => {
     }
     return { error: "Unknown routines operation " + op };
   } catch (e) {
-    return { error: errorText(e) };
+    const why = (${PAGE_PARKED})(e);
+    return why ? { asleep: why } : { error: errorText(e) };
   } finally {
     unsubscribe();
   }

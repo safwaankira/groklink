@@ -22,13 +22,18 @@ export type Methods = Record<string, Handler>;
 /** What the methods need from the transport. Tests pass a fake. `wake` brings the Grok Bot window to the front. */
 export type Link = { mode: TransportMode; connected: boolean; appVersion: string | null; requireCdp(): CDP; wake?(): Promise<void> };
 
-/** Text of the errors that mean the Bot's computer is asleep (ours and the app's), wherever they were thrown. */
-const ASLEEP_TEXT = /computer is asleep|put the Bot's computer to sleep|sand-box-blocked|SAND_AWAY_PARK/;
 const ASLEEP_PHASES = ["away", "asleep"];
 
+/**
+ * Whether a call failed because the Bot's computer is asleep. Only the error's class decides: the base code throws
+ * BotAsleepError from the app's own failure code, and message text (which can carry Bot or file names) is never read.
+ */
 export function isAsleep(e: unknown): boolean {
-  return e instanceof BotAsleepError || ASLEEP_TEXT.test(String((e as Error)?.message ?? e));
+  return e instanceof BotAsleepError;
 }
+
+/** The Bot a call is for: the wake rate limit is kept per id, so another name for the same Bot can't get around it. */
+export type WakeTarget = { id: string; name: string };
 
 export type WakeOptions = {
   /** How long to wait for the computer to wake after bringing the window to the front (15 s). */
@@ -57,23 +62,23 @@ export class Waker {
   }
 
   /** Run `fn`; if it fails because `bot`'s computer is asleep, wake it once and retry once. */
-  async attempt<T>(method: string, bot: string, fn: () => Promise<T>): Promise<T> {
+  async attempt<T>(method: string, bot: WakeTarget, fn: () => Promise<T>): Promise<T> {
     try {
       return await fn();
     } catch (e) {
       if (!isAsleep(e)) throw e;
-      const name = e instanceof BotAsleepError && e.bot ? e.bot : bot;
-      if (!(await this.wake(name, method))) throw new BotAsleepError(name);
+      if (!(await this.wake(bot, method))) throw new BotAsleepError(bot.name);
       try {
         return await fn();
       } catch (again) {
-        throw isAsleep(again) ? new BotAsleepError(name) : again;
+        throw isAsleep(again) ? new BotAsleepError(bot.name) : again;
       }
     }
   }
 
-  private async wake(bot: string, method: string): Promise<boolean> {
-    const key = bot.toLowerCase();
+  private async wake(target: WakeTarget, method: string): Promise<boolean> {
+    const bot = target.name;
+    const key = target.id;
     const now = this.o.now();
     const last = this.last.get(key);
     if (last !== undefined && now - last < this.o.cooldownMs) {
@@ -159,8 +164,8 @@ function findRoutine(list: Routine[], query: string): Routine | null {
   return partial.length === 1 ? partial[0] : null;
 }
 
-/** `policy` checks text that would reach the Bot; the same check tasks get. */
-async function routines(cdp: CDP, p: Record<string, unknown>, policy: (text: string) => void) {
+/** `policy` checks text that would reach the Bot; the same check tasks get. `usageGuard` refuses a run when usage is out or paused. */
+async function routines(cdp: CDP, p: Record<string, unknown>, policy: (text: string) => void, usageGuard: () => Promise<void>) {
   const { str, optNum, optBool } = reader(p);
   const action = str("action");
   if (action === "list") return listRoutines(cdp, str("bot"));
@@ -180,6 +185,8 @@ async function routines(cdp: CDP, p: Record<string, unknown>, policy: (text: str
   if (action === "run") {
     policy(str("routine"));
     await storedPrompt(true);
+    // A run uses Grok usage like a task does.
+    await usageGuard();
     return runRoutine(cdp, str("bot"), str("routine"));
   }
   const seconds = optNum("timeout_seconds");
@@ -204,8 +211,8 @@ async function routines(cdp: CDP, p: Record<string, unknown>, policy: (text: str
 type Health = HealthResult & {
   selftest: SelfTestResult | null;
   usage: UsageSummary | null;
-  /** x_write's mode ("block" | "approve" | "allow"); tx, wallet and claim on or off. */
-  policy: Record<string, boolean | string> | null;
+  /** x_write's mode ("block" | "approve" | "allow"); tx, wallet and claim on or off; `usage` is the warn and pause percents. */
+  policy: Record<string, boolean | string | { warn: number; pause: number }> | null;
   warnings: string[];
   probe?: ProbeResult;
 };
@@ -220,15 +227,6 @@ export function daemonMethods(
   const startedAt = opts.startedAt ?? Date.now();
   const cdp = () => link.requireCdp();
   const waker = new Waker(link, opts.log ?? (() => {}), opts.wake);
-  /** An asleep failure from a call that isn't retried (it may have messaged the Bot) still gets the bot_asleep code. */
-  const asleepAs = async <T>(bot: string, fn: () => Promise<T>): Promise<T> => {
-    try {
-      return await fn();
-    } catch (e) {
-      if (isAsleep(e) && !(e instanceof BotAsleepError)) throw new BotAsleepError(bot);
-      throw e;
-    }
-  };
   const need = <T>(v: T | undefined): T => {
     if (!v) throw new ProtocolError("internal", "Jobs aren't set up in this daemon.");
     return v;
@@ -244,11 +242,18 @@ export function daemonMethods(
         uptimeSec: Math.floor((Date.now() - startedAt) / 1000),
         selftest: opts.selftest?.result ?? null,
         usage: opts.jobs?.usageSnapshot() ?? null,
-        policy: opts.jobs?.policyState().rules ?? null,
-        warnings: [...(link.mode === "port0" ? [PORT0_WARNING] : []), ...(opts.jobs?.policyState().warnings ?? [])],
+        policy: opts.jobs ? { ...opts.jobs.policyState().rules, usage: opts.jobs.usageLimits() } : null,
+        warnings: [
+          ...(link.mode === "port0" ? [PORT0_WARNING] : []),
+          ...(opts.jobs?.policyState().warnings ?? []),
+          ...(opts.jobs?.usageWarnings() ?? []),
+        ],
       });
       if (!reader(p).optBool("deep")) return plain();
-      return deepProbe(cdp).then((probe) => {
+      // The probe reads usage itself; refresh the daemon's reading too, so the warn line is as fresh as the check.
+      const refreshed = opts.jobs?.usageSummary().catch(() => null);
+      return deepProbe(cdp, { usage: opts.jobs?.usageLimits() }).then(async (probe) => {
+        await refreshed;
         const h = plain();
         return { ...h, probe, warnings: [...h.warnings, ...probeWarnings(probe)] };
       });
@@ -285,9 +290,8 @@ export function daemonMethods(
     },
     read: async (p) => {
       const { str, optNum, optStr } = reader(p);
-      return untrusted(
-        await waker.attempt("read", str("bot"), () => read(cdp(), str("bot"), { limit: optNum("limit"), since: optStr("since") })),
-      );
+      const bot = await findBot(cdp(), str("bot"));
+      return untrusted(await waker.attempt("read", bot, () => read(cdp(), bot.id, { limit: optNum("limit"), since: optStr("since") })));
     },
     stop: (p) => stop(cdp(), reader(p).str("bot")),
     download: async (p) => {
@@ -308,21 +312,28 @@ export function daemonMethods(
         (real) => {
           checkDownloadDir(real, where);
         },
-        (fn) => waker.attempt("download", bot.name, fn),
+        (fn) => waker.attempt("download", bot, fn),
       );
     },
     usage: () => usage(cdp()),
     // Routine names, prompts, the Bot's reply and its error text all come from the Bot's side.
     routines: async (p) => {
-      const bot = typeof p.bot === "string" ? p.bot : "The Bot";
-      const go = () => routines(cdp(), p, (text) => opts.jobs?.checkPolicy(text));
-      // list and run only read the app's store, so they can be retried; the others send the Bot a message.
-      const result = ["list", "run"].includes(String(p.action)) ? await waker.attempt("routines", bot, go) : await asleepAs(bot, go);
+      const go = () =>
+        routines(
+          cdp(),
+          p,
+          (text) => opts.jobs?.checkPolicy(text),
+          async () => opts.jobs?.checkUsage(),
+        );
+      // list and run only read the app's store, so an asleep failure there gets the one wake-and-retry. The others
+      // send the Bot a message, so they're never retried; an asleep failure from them is already bot_asleep.
+      const retry = ["list", "run"].includes(String(p.action)) && typeof p.bot === "string" && p.bot.trim() !== "";
+      const result = retry ? await waker.attempt("routines", await findBot(cdp(), p.bot as string), go) : await go();
       return { ...(result as object), untrusted: true };
     },
     createBot: (p) => {
       const { str, optStr } = reader(p);
-      return asleepAs(str("name"), () => createBot(cdp(), { name: str("name"), description: optStr("description") }));
+      return createBot(cdp(), { name: str("name"), description: optStr("description") });
     },
     updateBot: (p) => {
       const { str, optStr } = reader(p);
@@ -330,7 +341,7 @@ export function daemonMethods(
       const description = optStr("description");
       if (name === undefined && description === undefined)
         throw new ProtocolError("bad_request", 'Pass "name" or "description" to change.');
-      return asleepAs(str("bot"), () => updateBot(cdp(), str("bot"), { name, description }));
+      return updateBot(cdp(), str("bot"), { name, description });
     },
     deleteBot: (p) => {
       const { str } = reader(p);
@@ -340,13 +351,21 @@ export function daemonMethods(
   };
 }
 
-/**
- * An error message's first line, for daemon.log: at most 200 characters. Error messages name Bots, files and rules;
- * they never carry Bot replies or file contents.
- */
+/** A message's first line, at most 200 characters. */
 export function logLine(message: string): string {
   const first = message.split("\n")[0].trim();
   return first.length > 200 ? `${first.slice(0, 200)}…` : first;
+}
+
+/**
+ * The daemon.log line for a failed call. Grok Link's own errors (ProtocolError) have fixed wording that names only
+ * Bots, files and rules, so their first line is logged. Any other error comes from the app or the Bot's side (a routine
+ * name, the app's error text), so only its code is logged, never its message.
+ */
+export function failureLine(method: string, e: unknown): string {
+  if (!(e instanceof ProtocolError)) return `${method} failed (internal)`;
+  const rule = (e as { rule?: unknown }).rule;
+  return `${method} failed (${e.code}${typeof rule === "string" ? `, rule ${rule}` : ""}): ${logLine(e.message)}`;
 }
 
 function tokenMatches(given: unknown, key: Buffer): boolean {
@@ -398,14 +417,12 @@ function serve(socket: Socket, key: Buffer, methods: Methods, log: Log): void {
     if (typeof params !== "object" || Array.isArray(params)) return fail(id, "bad_request", "params must be an object.");
     try {
       reply({ id, result: await methods[method](params as Record<string, unknown>) });
-    } catch (thrown) {
-      // An asleep failure nobody mapped (a Bot name isn't known here) is still bot_asleep, never internal.
-      const e = !(thrown instanceof ProtocolError) && isAsleep(thrown) ? new BotAsleepError("The Bot") : thrown;
+    } catch (e) {
       const code = e instanceof ProtocolError ? e.code : "internal";
       const message = String((e as Error)?.message ?? e);
       const rule = e instanceof ProtocolError ? (e as { rule?: unknown }).rule : undefined;
       const retryAfterSec = e instanceof ProtocolError ? (e as { retryAfterSec?: unknown }).retryAfterSec : undefined;
-      log(`${method} failed (${code}${typeof rule === "string" ? `, rule ${rule}` : ""}): ${logLine(message)}`);
+      log(failureLine(method, e));
       reply({
         id,
         error: {

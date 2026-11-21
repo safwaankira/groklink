@@ -4,16 +4,28 @@ import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { statePaths } from "../daemon/state.ts";
-import { loadPolicy, policyFileError, RULES, writeXMode, X_MODES, type XMode, xMode } from "../shared/policy.ts";
+import {
+  loadPolicy,
+  policyFileError,
+  RULES,
+  usageLimits,
+  writeUsageLimit,
+  writeXMode,
+  X_MODES,
+  type XMode,
+  xMode,
+} from "../shared/policy.ts";
 import type { Method } from "../shared/protocol.ts";
 import { VERSION } from "../shared/version.ts";
 import { defaultEnv, install, installSkill, LABEL, uninstall } from "./install.ts";
 import { serveMcp } from "./mcp.ts";
+import { setup } from "./setup.ts";
 import { call } from "./socket.ts";
 
 const USAGE = `groklink ${VERSION}
 
 Usage:
+  groklink setup [--dry-run]                     First use: install, add the skill, wait for the daemon, run doctor
   groklink mcp                                   Run the MCP server on stdio
   groklink health [--deep]                       Daemon and app status (--deep: live checks through Grok Bot)
   groklink doctor [--send <bot>] [--json]        Check the whole path, one line per check; exit 0 = PASS
@@ -29,7 +41,11 @@ Usage:
   groklink uninstall [--dry-run]                 Undo install (keeps the state folder)
   groklink policy                                Show each safety rule and its mode
   groklink policy x_write <block|approve|allow>  How Bots may post to X: block (default), approve (you approve
-                                                 each posting task in a dialog on this Mac) or allow; restarts the daemon`;
+                                                 each posting task in a dialog on this Mac) or allow; restarts the daemon
+  groklink policy usage                          Show the usage limits (percent of weekly Grok usage)
+  groklink policy usage warn <0-100>             Warn in health and doctor from this percent (default 80)
+  groklink policy usage pause <1-100>            Refuse new tasks from this percent (default 100: only when used up);
+                                                 both restart the daemon`;
 
 class UsageError extends Error {}
 
@@ -156,21 +172,10 @@ async function sendCheck(bot: string): Promise<Check & { jobId?: string }> {
   }
 }
 
-/** `groklink doctor`: deep health, one line per check, then PASS or FAIL: <first failed check>. Returns the exit code. */
-async function doctor(args: string[]): Promise<number> {
-  const json = args.includes("--json");
-  const { pos, opts } = parse(
-    args.filter((a) => a !== "--json"),
-    ["send"],
-  );
-  if (pos.length) throw new UsageError("doctor takes no arguments besides --send <bot> and --json.");
-  const bot = opts.send?.[0];
-  if (bot !== undefined && !bot.trim()) throw new UsageError("--send needs a Bot name.");
-  const say = (s: string) => {
-    if (!json) console.log(s);
-  };
+type DeepHealth = { probe?: { ok: boolean; checks: Check[] }; warnings?: string[]; [k: string]: unknown };
 
-  type DeepHealth = { probe?: { ok: boolean; checks: Check[] }; warnings?: string[]; [k: string]: unknown };
+/** Doctor's checks: deep health (read-only; nothing is sent), plus the policy line. Never throws. */
+async function deepChecks(): Promise<{ health: DeepHealth | null; checks: Check[] }> {
   let health: DeepHealth | null = null;
   let checks: Check[];
   try {
@@ -202,6 +207,25 @@ async function doctor(args: string[]): Promise<number> {
       },
     ];
   }
+  return { health, checks };
+}
+
+/** `groklink doctor`: deep health, one line per check, then PASS or FAIL: <first failed check>. Returns the exit code. */
+async function doctor(args: string[]): Promise<number> {
+  const json = args.includes("--json");
+  const { pos, opts } = parse(
+    args.filter((a) => a !== "--json"),
+    ["send"],
+  );
+  if (pos.length) throw new UsageError("doctor takes no arguments besides --send <bot> and --json.");
+  const bot = opts.send?.[0];
+  if (bot !== undefined && !bot.trim()) throw new UsageError("--send needs a Bot name.");
+  const say = (s: string) => {
+    if (!json) console.log(s);
+  };
+
+  const { health, checks: deep } = await deepChecks();
+  let checks = deep;
   for (const c of checks) say(line(c));
 
   let send: (Check & { jobId?: string }) | undefined;
@@ -234,7 +258,42 @@ function showPolicy(file: string): void {
   const broken = policyFileError(file);
   if (broken) console.log(`Can't read it (${broken}); the daemon treats every rule as on (x_write: block) until it's fixed.`);
   for (const r of RULES) console.log(`  ${r.padEnd(8)} ${r === "x_write" ? x.mode : on(r) ? "on" : "off"}`);
+  showUsage(parsed);
   if (x.warning) console.log(x.warning);
+}
+
+/** The two usage limits, one line each. */
+function showUsage(parsed: unknown): void {
+  const u = usageLimits(parsed);
+  console.log(`  usage    warn at ${u.warn}%, pause new tasks at ${u.pause}%${u.pause === 100 ? " (only when used up)" : ""}`);
+  if (u.warning) console.log(u.warning);
+}
+
+/** Restart the daemon so a policy change applies. Returns the exit code. */
+function restartDaemon(what: string): number {
+  const uid = process.getuid?.() ?? 0;
+  const r = spawnSync("launchctl", ["kickstart", "-k", `gui/${uid}/${LABEL}`], { stdio: "ignore" });
+  if (r.status === 0) {
+    console.log(`Restarted the daemon (launchctl kickstart -k gui/${uid}/${LABEL}) so the new ${what} applies.`);
+    return 0;
+  }
+  console.log(`Couldn't restart the daemon with launchctl. Restart groklinkd yourself to apply the new ${what}.`);
+  return 1;
+}
+
+/** `groklink policy usage <warn|pause> <percent>`: rewrite policy.json atomically (0600), then restart the daemon. */
+function setUsage(file: string, key: string, value: string): number {
+  if (key !== "warn" && key !== "pause") throw new UsageError("policy usage takes: warn <0-100> or pause <1-100>.");
+  if (!/^\d{1,3}$/.test(value)) throw new UsageError(`${key} must be a whole number from ${key === "warn" ? 0 : 1} to 100.`);
+  let limits: { warn: number; pause: number };
+  try {
+    limits = writeUsageLimit(file, key, Number(value));
+  } catch (e) {
+    if (e instanceof RangeError) throw new UsageError(e.message);
+    throw e;
+  }
+  console.log(`Set usage ${key} to ${limits[key]}% in ${file} (warn at ${limits.warn}%, pause new tasks at ${limits.pause}%).`);
+  return restartDaemon("limit");
 }
 
 /** `groklink policy x_write <mode>`: rewrite policy.json atomically (0600), then restart the daemon to apply it. */
@@ -244,14 +303,7 @@ function setXMode(file: string, mode: string): number {
   console.log(`Set x_write to ${mode} in ${file}.`);
   if (mode === "allow") console.log("Bots may now post to X without asking you.");
   if (mode === "approve") console.log("Tasks that would post to X now wait for you to click Approve in a dialog on this Mac.");
-  const uid = process.getuid?.() ?? 0;
-  const r = spawnSync("launchctl", ["kickstart", "-k", `gui/${uid}/${LABEL}`], { stdio: "ignore" });
-  if (r.status === 0) {
-    console.log(`Restarted the daemon (launchctl kickstart -k gui/${uid}/${LABEL}) so the new mode applies.`);
-    return 0;
-  }
-  console.log(`Couldn't restart the daemon with launchctl. Restart groklinkd yourself to apply the new mode.`);
-  return 1;
+  return restartDaemon("mode");
 }
 
 const [cmd = "", ...args] = process.argv.slice(2);
@@ -268,7 +320,14 @@ if (cmd === "mcp") {
       showPolicy(file);
       process.exit(0);
     }
-    if (args.length !== 2 || args[0] !== "x_write") throw new UsageError("policy takes no arguments, or: x_write <block|approve|allow>.");
+    if (args[0] === "usage" && args.length === 1) {
+      console.log(`Policy: ${file}`);
+      showUsage(loadPolicy(file));
+      process.exit(0);
+    }
+    if (args[0] === "usage" && args.length === 3) process.exit(setUsage(file, args[1], args[2]));
+    if (args.length !== 2 || args[0] !== "x_write")
+      throw new UsageError("policy takes no arguments, or: x_write <block|approve|allow>, usage, usage warn <0-100>, usage pause <1-100>.");
     process.exit(setXMode(file, args[1]));
   } catch (e) {
     if (e instanceof UsageError) {
@@ -276,6 +335,27 @@ if (cmd === "mcp") {
       process.exit(2);
     }
     console.error(`groklink policy: ${(e as Error).message}`);
+    process.exit(1);
+  }
+} else if (cmd === "setup") {
+  const bad = args.find((a) => a !== "--dry-run");
+  if (bad !== undefined) {
+    console.error(`Unknown option ${bad} (setup takes only --dry-run).\n\n${USAGE}`);
+    process.exit(2);
+  }
+  try {
+    process.exit(
+      await setup(
+        {
+          ...defaultEnv(),
+          doctor: async () => (await deepChecks()).checks,
+          bots: async () => ((await call("bots")) as { name: string }[]).map((b) => b.name),
+        },
+        { dryRun: args.includes("--dry-run") },
+      ),
+    );
+  } catch (e) {
+    console.error(`groklink setup: ${(e as Error).message}`);
     process.exit(1);
   }
 } else if (cmd === "doctor") {

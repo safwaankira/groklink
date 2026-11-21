@@ -123,7 +123,13 @@ test("writeXMode: rewrites x_write only, mode 0600, atomically (no temp file lef
   assert.deepEqual(readdirSync(home), ["policy.json"]);
   rmSync(file);
   writeXMode(file, "allow");
-  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { x_write: "allow", tx: true, wallet: true, claim: true });
+  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), {
+    x_write: "allow",
+    tx: true,
+    wallet: true,
+    claim: true,
+    usage: { warn: 80, pause: 100 },
+  });
 });
 
 // ---- each mode's create path ----

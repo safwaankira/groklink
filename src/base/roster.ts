@@ -1,7 +1,9 @@
 // Create, update and delete Bots through the app's own roster client (see page.ts).
+
+import { BotAsleepError } from "../shared/protocol.ts";
 import { listBots, matchBot } from "./bot.ts";
 import type { CDP } from "./cdp.ts";
-import { PAGE_AWAKE, PAGE_ERROR, store } from "./page.ts";
+import { PAGE_AWAKE, PAGE_ERROR, PAGE_PARKED, store } from "./page.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -17,6 +19,7 @@ const PAGE_OP = `async (op, arg) => {
   const profile = (r) => ({ id: r.id, name: r.name, description: r.description || "", hidden: !!r.isHiddenFromSidebar, running: !!r.isRunning });
   const message = ${PAGE_ERROR};
   const awake = ${PAGE_AWAKE};
+  const parked = ${PAGE_PARKED};
   try {
     if (op === "create") {
       const res = await roster.createAgent({ name: arg.name, description: arg.description, origin: "user", isKickstartRequested: false });
@@ -36,12 +39,15 @@ const PAGE_OP = `async (op, arg) => {
     }
     return { error: "Unknown roster operation " + op };
   } catch (e) {
-    return { error: message(e) };
+    const why = parked(e);
+    return why ? { asleep: why } : { error: message(e) };
   }
 }`;
 
-async function op<T>(cdp: CDP, name: string, arg?: unknown): Promise<T> {
-  const r = await cdp.call<{ value?: T; error?: string }>(PAGE_OP, name, arg ?? null);
+/** `bot` names the Bot in the error if the app has parked its computer. */
+async function op<T>(cdp: CDP, name: string, bot: string, arg?: unknown): Promise<T> {
+  const r = await cdp.call<{ value?: T; error?: string; asleep?: string }>(PAGE_OP, name, arg ?? null);
+  if (r.asleep !== undefined) throw new BotAsleepError(bot);
   if (r.error !== undefined) throw new Error(r.error);
   return r.value as T;
 }
@@ -52,7 +58,7 @@ export async function createBot(cdp: CDP, input: { name: string; description?: s
   if (!name) throw new Error("A Bot needs a name.");
   const profiles = await listBots(cdp).catch(() => []);
   if (profiles.some((p) => p.name.toLowerCase() === name.toLowerCase())) throw new Error(`You already have a Bot named "${name}".`);
-  const bot = await op<BotProfile>(cdp, "create", { name, description: input.description?.trim() ?? "" });
+  const bot = await op<BotProfile>(cdp, "create", name, { name, description: input.description?.trim() ?? "" });
   // Wait for it to show up in the sidebar so `ask`/`send` can open it right away.
   for (let i = 0; i < 25; i++) {
     if ((await listBots(cdp).catch(() => [])).some((b) => b.id === bot.id)) break;
@@ -69,7 +75,7 @@ export async function updateBot(cdp: CDP, query: string, changes: { name?: strin
   if (name === current.name && description === current.description) {
     return { id: current.id, name, description, hidden: current.hidden, running: current.running };
   }
-  return op<BotProfile>(cdp, "update", { id: current.id, name, description });
+  return op<BotProfile>(cdp, "update", current.name, { id: current.id, name, description });
 }
 
 /**
@@ -83,6 +89,6 @@ export async function deleteBot(cdp: CDP, query: string): Promise<{ id: string; 
     throw new Error(matches.length ? `"${query}" matches several Bots. Use the Bot's id.` : `No Bot named exactly "${query}".`);
   }
   const [bot] = matches;
-  await op(cdp, "delete", { id: bot.id });
+  await op(cdp, "delete", bot.name, { id: bot.id });
   return { id: bot.id, name: bot.name };
 }

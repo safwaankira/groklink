@@ -7,7 +7,8 @@ import { execFile } from "node:child_process";
  * `queue_full`: too many requests were already waiting; no dialog was shown.
  */
 export type Decision = "approved" | "denied" | "timeout" | "error" | "queue_full";
-export type ApprovalRequest = { jobId: string; bot: string; brief: string };
+/** `botId` is shown instead of the name when the name isn't plain text. */
+export type ApprovalRequest = { jobId: string; bot: string; botId?: string; brief: string };
 /** Shows one dialog for `seconds` at most and resolves with what the user did. Tests pass a fake. */
 export type Dialog = (r: ApprovalRequest, seconds: number) => Promise<Decision>;
 
@@ -22,33 +23,92 @@ const DENY = "Deny";
 /** Most lines a brief that needs approval may have, so nothing can be pushed far down out of view. */
 export const MAX_APPROVAL_LINES = 40;
 
+/** Longest Bot name the dialog shows; a longer or non-plain name is replaced by the Bot's id. */
+export const MAX_DIALOG_BOT_NAME = 60;
+
 const PICTO = /\p{Extended_Pictographic}/u;
+const UNASSIGNED = /\p{Cn}/u;
 const VS16 = 0xfe0f;
 const ZWJ = 0x200d;
+const KEYCAP = 0x20e3;
+const isKeycapBase = (cp: number | undefined) => cp !== undefined && ((cp >= 0x30 && cp <= 0x39) || cp === 0x23 || cp === 0x2a);
+const isSkinTone = (cp: number | undefined) => cp !== undefined && cp >= 0x1f3fb && cp <= 0x1f3ff;
+const isRegional = (cp: number | undefined) => cp !== undefined && cp >= 0x1f1e6 && cp <= 0x1f1ff;
+/** An assigned emoji code point (Extended_Pictographic also covers code points reserved for future emoji). */
+const isEmoji = (cp: number | undefined) => {
+  if (cp === undefined) return false;
+  const c = String.fromCodePoint(cp);
+  return PICTO.test(c) && !UNASSIGNED.test(c);
+};
 
 /**
- * Why `brief` can't be approved, or null if it can. Approve mode accepts plain text only: every character must be
- * printable ASCII (U+0020–U+007E), a newline, or an emoji (Extended_Pictographic, with U+FE0F and U+200D allowed only
- * inside an emoji sequence). At most 40 lines, and no more than 2 blank lines in a row. So the dialog can only show
- * text that reads the way it looks: no look-alike letters, invisible or blank-looking characters, or bidi tricks.
+ * The first character of `text` that isn't plain: null if every character is printable ASCII (U+0020–U+007E), a
+ * newline, or part of an emoji. Emoji are assigned Extended_Pictographic code points, plus, only in their place in a
+ * sequence: U+FE0F after an emoji, a skin tone (U+1F3FB–U+1F3FF) after an emoji, U+200D between two emoji, flags
+ * (regional indicators, in pairs) and keycaps (0-9, # or *, optional U+FE0F, then U+20E3).
  */
-export function approvalTextProblem(brief: string): string | null {
-  const cps = [...brief].map((c) => c.codePointAt(0) ?? 0);
-  const picto = (cp: number | undefined) => cp !== undefined && PICTO.test(String.fromCodePoint(cp));
+function firstNonPlain(text: string): { cp: number; at: number } | null {
+  const cps = [...text].map((c) => c.codePointAt(0) ?? 0);
+  /** The emoji (with its U+FE0F and skin tone, if any) ending just before index i. */
+  const emojiEndsAt = (i: number) => {
+    let j = i - 1;
+    if (isSkinTone(cps[j])) j--;
+    if (cps[j] === VS16) j--;
+    return j >= 0 && isEmoji(cps[j]);
+  };
   for (let i = 0; i < cps.length; i++) {
     const cp = cps[i];
-    if ((cp >= 0x20 && cp <= 0x7e) || cp === 0x0a || picto(cp)) continue;
-    // U+FE0F right after an emoji; U+200D between an emoji (or its U+FE0F) and the next emoji.
-    if (cp === VS16 && picto(cps[i - 1])) continue;
-    if (cp === ZWJ && (picto(cps[i - 1]) || (cps[i - 1] === VS16 && picto(cps[i - 2]))) && picto(cps[i + 1])) continue;
-    const hex = cp.toString(16).toUpperCase().padStart(4, "0");
-    return `approve mode accepts plain text only (printable ASCII, newlines and emoji); the brief has U+${hex} at character ${i + 1}`;
+    if ((cp >= 0x20 && cp <= 0x7e) || cp === 0x0a || isEmoji(cp)) continue;
+    // U+FE0F right after an emoji, or in a keycap (digit, U+FE0F, U+20E3).
+    if (cp === VS16 && (isEmoji(cps[i - 1]) || (isKeycapBase(cps[i - 1]) && cps[i + 1] === KEYCAP))) continue;
+    if (cp === KEYCAP && (isKeycapBase(cps[i - 1]) || (cps[i - 1] === VS16 && isKeycapBase(cps[i - 2])))) continue;
+    // A skin tone right after an emoji (or its U+FE0F).
+    if (isSkinTone(cp) && (isEmoji(cps[i - 1]) || (cps[i - 1] === VS16 && isEmoji(cps[i - 2])))) continue;
+    // U+200D between an emoji (with its U+FE0F or skin tone) and the next emoji.
+    if (cp === ZWJ && emojiEndsAt(i) && isEmoji(cps[i + 1])) continue;
+    // Flags: regional indicators come in pairs.
+    if (isRegional(cp)) {
+      let end = i;
+      while (isRegional(cps[end + 1])) end++;
+      if ((end - i + 1) % 2 === 0) {
+        i = end;
+        continue;
+      }
+    }
+    return { cp, at: i + 1 };
+  }
+  return null;
+}
+
+/**
+ * Why `brief` can't be approved, or null if it can. Approve mode accepts plain text only (see `firstNonPlain`), at most
+ * 40 lines, and no more than 2 blank lines in a row. So the dialog can only show text that reads the way it looks: no
+ * look-alike letters, invisible or blank-looking characters, bidi tricks or unassigned code points.
+ */
+export function approvalTextProblem(brief: string): string | null {
+  const bad = firstNonPlain(brief);
+  if (bad) {
+    const hex = bad.cp.toString(16).toUpperCase().padStart(4, "0");
+    return `approve mode accepts plain text only (printable ASCII, newlines and emoji); the brief has U+${hex} at character ${bad.at}`;
   }
   if (brief.split("\n").length > MAX_APPROVAL_LINES)
     return `approve mode accepts plain text only, at most ${MAX_APPROVAL_LINES} lines; the brief has ${brief.split("\n").length}`;
   // Three or more blank (space-only) lines in a row.
   if (/(?:^|\n)(?: *\n){3,}/.test(brief)) return "approve mode accepts plain text only, with no more than 2 blank lines in a row";
   return null;
+}
+
+/**
+ * How the dialog names the Bot. A Bot's name can be changed by anything that can rename Bots, so it's shown only if it
+ * passes the same plain-text rule as the brief, on one line, in at most 60 characters. Otherwise the Bot's id is shown.
+ */
+export function dialogBot(r: ApprovalRequest): string {
+  const name = r.bot;
+  const plain = name.trim() !== "" && !name.includes("\n") && [...name].length <= MAX_DIALOG_BOT_NAME && firstNonPlain(name) === null;
+  if (plain) return `the Grok Bot "${name}"`;
+  return r.botId && /^[A-Za-z0-9_-]{1,80}$/.test(r.botId)
+    ? `the Grok Bot with id ${r.botId} (its name isn't plain text, so it isn't shown)`
+    : "a Grok Bot (its name isn't plain text, so it isn't shown)";
 }
 
 /** "10 minutes", "1 minute", "90 seconds". */
@@ -59,7 +119,7 @@ export function duration(seconds: number): string {
 
 /** The dialog's text: the Bot and the whole brief (briefs over MAX_APPROVAL_BRIEF never get a dialog). */
 export function dialogText(r: ApprovalRequest, seconds = DIALOG_SECONDS): string {
-  return `A task for the Grok Bot "${r.bot}" asks it to post to X. This is the whole brief:\n\n${r.brief}\n\nSend it? (Deny is the default; this closes itself after ${duration(seconds)}.)`;
+  return `A task for ${dialogBot(r)} asks it to post to X. This is the whole brief:\n\n${r.brief}\n\nSend it? (Deny is the default; this closes itself after ${duration(seconds)}.)`;
 }
 
 /** What osascript printed on success, as a decision. Anything but a clear "Approve and send" in time is a denial. */

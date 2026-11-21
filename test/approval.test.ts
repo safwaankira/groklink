@@ -176,7 +176,7 @@ test("approve: the job goes needs_approval → queued → working and the brief 
   const { jobId, status } = await j.create({ bot: "Alpha", brief: POST });
   assert.equal(status, "needs_approval");
   await until(() => d.shown.length === 1);
-  assert.deepEqual(d.shown[0], { jobId, bot: "Alpha", brief: POST });
+  assert.deepEqual(d.shown[0], { jobId, bot: "Alpha", botId: "b1", brief: POST });
   assert.deepEqual(sent, []);
   d.answer("approved");
   await until(() => sent.length === 1);
@@ -630,7 +630,7 @@ test("T17f: approvalTextProblem accepts printable ASCII, newlines and emoji only
     ["a\u200db", "200D"], // ZWJ between letters
     ["\u{1F680}\u200d", "200D"], // ZWJ with no emoji after it
     ["a\u2028b", "2028"],
-    ["\u{1F1FA}\u{1F1F8}", "1F1FA"], // regional indicators (flags) aren't Extended_Pictographic
+    ["\u{1F1FA}", "1F1FA"], // a regional indicator on its own (flags come in pairs)
   ];
   for (const [t, hex] of bad) {
     const problem = approvalTextProblem(t) ?? "";

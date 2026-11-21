@@ -1,6 +1,11 @@
 # Grok Link
 
-**A secure, always-on bridge that lets Claude, Cursor, Codex or any MCP client hand work to your Grok Bots and collect the results.**
+**Grok Link gives Claude, Cursor, Codex or any MCP client 11 tools to hand work to your Grok Bots and collect the results, through a secure, always-on bridge on your Mac.**
+
+```bash
+npm i -g groklink
+groklink setup
+```
 
 > [!NOTE]
 > Grok Link is an unofficial community project. It isn't affiliated with or endorsed by xAI. It automates the Grok Bot desktop app you already use, on your own Mac, under your own account.
@@ -12,7 +17,7 @@
 - **Jobs instead of timeouts.** `groklink_task` returns a job ID at once. A small daemon follows the Bot until it's done, so a 30-minute research task finishes even if no client stays connected.
 - **No open debug port.** The daemon talks to the app over a private pipe, not a TCP port another program could reach.
 - **Structured answers.** Pass a JSON Schema and get back a validated `result`. The daemon asks the Bot to fix a bad answer (at most twice).
-- **A safety policy.** Briefs that ask a Bot to post on X, sign transactions, connect a wallet or submit claims are refused before anything is sent.
+- **A safety policy.** Briefs that ask a Bot to post on X or take other risky actions are refused before anything is sent, and you can keep a reserve of your weekly usage (see Safety policy).
 
 ## Requirements
 
@@ -22,17 +27,18 @@
 
 ## Install
 
-```bash
-npm install -g groklink && groklink install
-```
+The two lines at the top are the whole install. `groklink setup` prints one line per step (`✓` or `✗`) and is safe to run again:
 
-`groklink install`:
+1. **install**: writes a LaunchAgent (`~/Library/LaunchAgents/dev.groklink.daemon.plist`) so the daemon starts at login and restarts if it stops, then registers the `groklink` MCP server in every client it finds: Claude Desktop, Claude Code (`claude mcp add --scope user`), Cursor and Codex. Each changed file is backed up to `.bak` first, and other entries are kept.
+2. **skill**: adds the agent skill for Claude Code (see Agent skill). An existing copy is kept.
+3. **daemon**: waits up to 30 s for the daemon to connect to Grok Bot.
+4. **doctor**: runs the read-only checks below.
 
-1. writes a LaunchAgent (`~/Library/LaunchAgents/dev.groklink.daemon.plist`) so the daemon starts at login and restarts if it stops,
-2. waits until the daemon is connected to Grok Bot,
-3. registers the `groklink` MCP server in every client it finds: Claude Desktop, Claude Code (`claude mcp add --scope user`), Cursor and Codex. Each changed file is backed up to `.bak` first, and other entries are kept.
+It never sends a Bot message. At the end it prints a command you can run to try one: `groklink doctor --send <bot>` (uses one Grok message). If a step fails, its line says how to fix it and setup exits 1; the steps already done stay done. `groklink setup --dry-run` shows what it would do.
 
-Quit Claude Desktop before running `groklink install`, then reopen it. Restart the other clients afterwards. `groklink install --dry-run` shows what would change without writing anything.
+`groklink install` runs step 1 on its own (it always reloads the daemon), and `groklink install --dry-run` shows what would change without writing anything.
+
+Quit Claude Desktop before running `groklink setup` or `groklink install`, then reopen it. Restart the other clients afterwards. `groklink install --dry-run` shows what would change without writing anything.
 
 If you use [grokbot-bridge](https://github.com/TheSethRose/grokbot-bridge), install stops and tells you where it's registered: the two can't share the app, because each relaunches it in its own mode. `groklink install --replace-grokbot-bridge` removes those entries (with backups) and installs Grok Link.
 
@@ -49,7 +55,7 @@ Runs a live, read-only check of the whole path and prints one line per check, th
 - `account`: signed in.
 - `roster`: at least one Bot.
 - `transcript`: a conversation can be read; no message text is printed.
-- `usage`: Grok usage isn't used up. If it is, the line says when it resets.
+- `usage`: Grok usage isn't used up. If it is, the line says when it resets. From your `warn` percent (default 80) it's a warning (`!`).
 - `awake`: the Bot's computer isn't asleep. This one is a warning (`!`), not a failure.
 
 Nothing is sent. `groklink doctor --send <bot>` also gives that Bot the task "Reply with only the word: pong" and passes only if it replies within 120 s. This uses one Grok message. `--json` prints the raw result. Agents get the same checks from `groklink_health` with `deep: true`.
@@ -60,7 +66,7 @@ Nothing is sent. `groklink doctor --send <bot>` also gives that Bot the task "Re
 groklink install --skill
 ```
 
-Copies the Grok Link skill to `~/.claude/skills/groklink/SKILL.md`. The skill tells Claude Code how to use the tools: check health first, poll jobs, what each status means, and the safety rules. It adds only the skill; run plain `groklink install` for the daemon and MCP setup. If you've edited your copy, it's kept; `--force` replaces it.
+Copies the Grok Link skill to `~/.claude/skills/groklink/SKILL.md`. The skill tells Claude Code how to use the tools: check health first, poll jobs, what each status means, and the safety rules. It adds only the skill (`groklink setup` runs this for you). If you've edited your copy, it's kept; `--force` replaces it.
 
 ## Tools
 
@@ -142,7 +148,7 @@ Supported keywords: `type` (`object`, `array`, `string`, `number`, `integer`, `b
 `~/.groklink/policy.json` is created on first start with every rule on:
 
 ```json
-{ "x_write": "block", "tx": true, "wallet": true, "claim": true }
+{ "x_write": "block", "tx": true, "wallet": true, "claim": true, "usage": { "warn": 80, "pause": 100 } }
 ```
 
 `groklink policy` shows each rule and its mode.
@@ -180,13 +186,28 @@ This rewrites `policy.json` (through a symlink, if yours is one) and restarts th
 
 In `approve` mode, the post must be asked for in the brief itself, so the dialog shows you everything that asks for it:
 - A task that needs approval can't have attachments or a JSON Schema (`blocked_by_policy`): put the post's text in the brief. A posting request hidden in an attachment or schema of any other task is blocked too.
-- Approve mode accepts plain text only. Every character of a posting brief must be printable ASCII, a newline, or an emoji. At most 40 lines, no more than 2 blank lines in a row, and at most 1,500 characters. Anything else is blocked: accented or look-alike letters (such as a Cyrillic "а" in a handle), tabs, invisible or blank-looking characters, bidi overrides. That way what the dialog shows reads exactly like what's sent.
-- The dialog shows the brief exactly as it will be sent.
+- Approve mode accepts plain text only. Every character of a posting brief must be printable ASCII, a newline, or an emoji (including flags, skin tones and keycaps; code points not yet assigned are refused). At most 40 lines, no more than 2 blank lines in a row, and at most 1,500 characters. Anything else is blocked: accented or look-alike letters (such as a Cyrillic "а" in a handle), tabs, invisible or blank-looking characters, bidi overrides. That way what the dialog shows reads exactly like what's sent.
+- The dialog shows the brief exactly as it will be sent. The Bot's name is shown only if it's plain text too (one line, at most 60 characters); otherwise the dialog shows the Bot's id.
 - At most 5 tasks wait for approval at once; another fails with `approval_queue_full`.
 - If the dialog can't be shown (for example, nobody is logged in to the Mac's screen), the task fails with `approval_error`.
 - After a daemon restart, held tasks follow the mode then in force: `block` fails them, `allow` sends them, and `approve` asks again.
 
 Old files keep working: `"x_write": true` is `block`, `false` is `allow`, and an unknown value is `block` with a warning. `groklink doctor` shows the mode, with a `!` line when it's `allow`.
+
+### Usage limits
+
+`usage` in `policy.json` keeps a reserve of your weekly Grok usage. Both numbers are percent used:
+
+- `warn` (default 80): from this point `groklink_health` warns "Grok usage is at N% (warn at W%)." and `groklink doctor` shows the usage line as `!`.
+- `pause` (default 100): from this point new tasks and routine runs are refused with `usage_paused`, and nothing is sent. Jobs already running aren't stopped. At 100, tasks stop only when usage is used up (`usage_exhausted`), as before.
+
+```bash
+groklink policy usage            # show both
+groklink policy usage warn 70
+groklink policy usage pause 90   # keep the last 10%
+```
+
+Setting one rewrites `policy.json` and restarts the daemon. `warn` can't be higher than `pause`. Like the X mode, the limits can't be changed through an MCP tool or socket call. A missing `usage` key means the defaults; invalid values mean the defaults too, with a warning in `groklink_health`.
 
 ## Security model
 
@@ -212,13 +233,27 @@ If the self-test fails, `groklink_task` refuses to send and names the failed che
 
 ## Troubleshooting
 
-**`bot_asleep`.** Grok Bot puts a Bot's computer to sleep when its window has been in the background for 10 minutes. Reading a conversation, downloading files and listing or running routines need it awake. When one of those calls hits an asleep Bot, Grok Link brings the Grok Bot window to the front once (at most once a minute per Bot, since it takes focus), waits up to 15 s and retries. If the Bot is still asleep, the call fails with `bot_asleep` and `retryAfterSec: 10`: bring Grok Bot to the front yourself and try again. `daemon.log` shows each failed call as `<method> failed (<code>): <reason>`, plus `woke <bot> for <method>` or `wake failed`.
+**`bot_asleep`.** Grok Bot puts a Bot's computer to sleep when its window has been in the background for 10 minutes. Reading a conversation, downloading files and listing or running routines need it awake. When one of those calls hits an asleep Bot, Grok Link brings the Grok Bot window to the front once (at most once a minute per Bot, since it takes focus), waits up to 15 s and retries. If the Bot is still asleep, the call fails with `bot_asleep` and `retryAfterSec: 10`: bring Grok Bot to the front yourself and try again. `daemon.log` shows each failed call as `<method> failed (<code>): <reason>` (only the code for errors that come from the app or a Bot), plus `woke <bot> for <method>` or `wake failed`. The once-a-minute limit follows the Bot, whatever name a call uses for it.
 
 **Closing the Grok Bot window or using another Grok Bot bridge.** If you close the Grok Bot window (Cmd+W), the app keeps running without it, and Grok Link reopens it as a Dock click would. If the window doesn't come back, Grok Link restarts the app. Running jobs carry on either way. Don't run Grok Link next to the old [grokbot-bridge](https://github.com/TheSethRose/grokbot-bridge): each one restarts Grok Bot in its own mode, so they keep quitting each other's copy of the app. That's why `groklink install` refuses while grokbot-bridge is registered.
 
-**`file_blocked` or `dir_blocked`.** The file you asked to attach, or the folder you asked to save into, is one Grok Link protects (see Security model). Attach a copy from another folder, or save under `~/.groklink/downloads` or `~/Downloads/groklink` (or a folder in `~/.groklink/download-roots.json`).
+**A download that stops part-way.** If a file fails after others were saved, `groklink_download` returns the saved files with `partial: true` and an `error` (code, message and the `failedKey`). Ask again for the missing keys only.
+
+**`file_blocked` or `dir_blocked`.** The file you asked to attach, or the folder you asked to save into, is one Grok Link protects (see Security model). If the message says the file is a link that points to a blocked location, the link's target is what's protected. Attach a copy from another folder, or save under `~/.groklink/downloads` or `~/Downloads/groklink` (or a folder in `~/.groklink/download-roots.json`).
 
 **`usage_exhausted`.** Your weekly Grok Bot usage is used up (100%) and on-demand usage is off or at its limit, so `groklink_task` refuses new tasks and stops running ones; the error says when usage resets. Enable on-demand usage in Grok Bot to continue sooner.
+
+**`usage_paused`.** Usage reached the `pause` percent you set (see Usage limits). New tasks wait until usage resets or you raise the limit with `groklink policy usage pause <percent>`.
+
+## Questions
+
+**Why not drive Grok Bot directly?** Grok Bot has no API, so the only way in is its desktop app. Driving the app yourself means an open debug port, calls that block until the Bot answers, and nothing that survives a restart. Grok Link keeps one private connection to the app and turns each request into a job you can poll, with a policy check before anything is sent.
+
+**Does it use extra tokens?** Not Grok ones: Grok Link sends your brief as written (plus one line when you pass a schema, and a short fix request if the answer doesn't match it), and reading results uses no Grok usage (adding or changing a routine is one short Bot turn). On the agent's side, a `groklink_job` result is the Bot's reply plus about 520 bytes of job fields: 566 bytes (roughly 140 tokens) for a one-word reply in the unit fixture. The 11 tool definitions add about 7 KB (roughly 1,700 tokens) once per session.
+
+**Is it official?** No. It's a community project, not affiliated with or endorsed by xAI. It automates the app you already run, under your own account.
+
+**What can't it do?** It can't run remotely or hosted: it needs the Grok Bot app on the same Mac, and other machines reach it only through an MCP client on that Mac. It can't post video. It also doesn't create or delete Bots, and it can't wake a Bot's computer while the Mac is locked or asleep.
 
 ## Uninstall
 

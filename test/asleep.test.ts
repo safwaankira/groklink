@@ -22,8 +22,11 @@ const BOT = {
   lastActivity: null,
   preview: null,
 };
+/** What the app's own error says when the computer is parked. The daemon must never decide "asleep" from this text. */
 const APP_ASLEEP =
   "Couldn't read /home/out.csv from the Bot's computer: Grok Bot has put the Bot's computer to sleep because its window hasn't been in front for 10 minutes (SAND_AWAY_PARK).";
+/** What a page function returns when the app's failure code says the computer is parked. */
+const PARKED = { groklinkAsleep: "SAND_AWAY_PARK" };
 
 let home: string;
 let saved: string | undefined;
@@ -59,7 +62,7 @@ function fakeApp(p: Partial<Page> = {}) {
     if (code.includes("boxHostPhase") && !code.includes("automations")) return page.phase;
     if (code.includes("readAttachmentBytes")) {
       counts.fileReads++;
-      if (page.asleepReads-- > 0) throw new Error(APP_ASLEEP);
+      if (page.asleepReads-- > 0) return PARKED;
       return Buffer.from("hello").toString("base64");
     }
     if (code.includes("automations")) {
@@ -132,10 +135,10 @@ test("asleep → wake succeeds → the retry works (read)", async () => {
   let first = true;
   const cdp = app.link.requireCdp();
   const inner = cdp.call.bind(cdp);
-  (cdp as unknown as { call: typeof inner }).call = async (fn: string, ...args: unknown[]) => {
+  (cdp as unknown as { call: (fn: string, ...args: unknown[]) => Promise<unknown> }).call = async (fn: string, ...args: unknown[]) => {
     if (args.length === 3 && first) {
       first = false;
-      throw new Error("sand-box-blocked: the computer is parked");
+      return PARKED;
     }
     return inner(fn, ...args);
   };
@@ -201,35 +204,69 @@ test("the rate limit is per Bot", async () => {
   let wakes = 0;
   const w = new Waker({ ...app.link, wake: async () => void wakes++ }, (l) => lines.push(l), { waitMs: 20, pollMs: 5, now: () => 0 });
   const asleep = (bot: string) => () => Promise.reject(new BotAsleepError(bot));
-  await assert.rejects(w.attempt("read", "Alpha", asleep("Alpha")), { code: "bot_asleep" });
-  await assert.rejects(w.attempt("read", "Beta", asleep("Beta")), { code: "bot_asleep" });
+  const alpha = { id: "b1", name: "Alpha" };
+  await assert.rejects(w.attempt("read", alpha, asleep("Alpha")), { code: "bot_asleep" });
+  await assert.rejects(w.attempt("read", { id: "b2", name: "Beta" }, asleep("Beta")), { code: "bot_asleep" });
   assert.equal(wakes, 2);
-  await assert.rejects(w.attempt("read", "Alpha", asleep("Alpha")), { code: "bot_asleep" });
+  await assert.rejects(w.attempt("read", alpha, asleep("Alpha")), { code: "bot_asleep" });
   assert.equal(wakes, 2);
+  // The limit follows the Bot's id: the same Bot under another name (its id, a prefix, different case) isn't woken again.
+  await assert.rejects(w.attempt("read", { id: "b1", name: "b1" }, asleep("b1")), { code: "bot_asleep" });
+  await assert.rejects(w.attempt("read", { id: "b1", name: "ALPHA" }, asleep("ALPHA")), { code: "bot_asleep" });
+  assert.equal(wakes, 2);
+  // And a different Bot that happens to share a name isn't held back by it.
+  await assert.rejects(w.attempt("read", { id: "b3", name: "Alpha" }, asleep("Alpha")), { code: "bot_asleep" });
+  assert.equal(wakes, 3);
 });
 
 test("non-asleep errors are passed through untouched, with no wake", async () => {
   const app = fakeApp();
   const w = new Waker(app.link, () => {}, { waitMs: 20, pollMs: 5 });
   await assert.rejects(
-    w.attempt("read", "Alpha", () => Promise.reject(new ProtocolError("not_found", "nope"))),
+    w.attempt("read", { id: "b1", name: "Alpha" }, () => Promise.reject(new ProtocolError("not_found", "nope"))),
     { code: "not_found" },
   );
   assert.equal(app.counts.wakes, 0);
   assert.equal(isAsleep(new Error("Couldn't read usage")), false);
-  assert.equal(isAsleep(new Error(APP_ASLEEP)), true);
+});
+
+test("asleep is decided by the error's class, never by message text", async () => {
+  assert.equal(isAsleep(new BotAsleepError("Alpha")), true);
+  // Text that used to match: the app's own wording, our wording, the app's failure code.
+  for (const text of [APP_ASLEEP, "Alpha's computer is asleep.", "sand-box-blocked", "SAND_AWAY_PARK"]) {
+    assert.equal(isAsleep(new Error(text)), false, text);
+    assert.equal(isAsleep(new ProtocolError("internal", text)), false, text);
+  }
+  // A routine named like an asleep error: the "no such routine" error names it, and is not treated as asleep.
+  const app = fakeApp({ phase: "settled" });
+  const { m, lines } = methods(app);
+  await assert.rejects(
+    Promise.resolve().then(() => m.routines({ action: "run", bot: "Alpha", routine: "computer is asleep" })),
+    (e: Error & { code?: string }) => e.code === undefined && /^No routine "computer is asleep"/.test(e.message),
+  );
+  assert.equal(app.counts.wakes, 0);
+  assert.deepEqual(lines, []);
 });
 
 test("routine actions that message the Bot are never retried; an asleep failure there is still bot_asleep", async () => {
   const app = fakeApp();
   const { m } = methods(app);
-  // "remove" goes through the Bot (a message); simulate the store saying asleep via an error.
+  // "remove" goes through the Bot (a message). The send reports the computer parked.
   const cdp = app.link.requireCdp();
-  (cdp as unknown as { call: () => Promise<never> }).call = () => Promise.reject(new Error("Alpha's computer is asleep (phase away)"));
+  const inner = cdp.call.bind(cdp);
+  let sends = 0;
+  (cdp as unknown as { call: (fn: string, ...args: unknown[]) => Promise<unknown> }).call = async (fn: string, ...args: unknown[]) => {
+    if (fn.includes("sendPrompt")) {
+      sends++;
+      return PARKED;
+    }
+    return inner(fn, ...args);
+  };
   await assert.rejects(
     Promise.resolve().then(() => m.routines({ action: "remove", bot: "Alpha", routine: "Daily", confirm: "Daily" })),
-    { code: "bot_asleep" },
+    { code: "bot_asleep", message: "Alpha's computer is asleep. Bring the Grok Bot window to the front, then try again in ~10 s." },
   );
+  assert.equal(sends, 1, "not retried");
   assert.equal(app.counts.wakes, 0);
 });
 
@@ -267,7 +304,7 @@ async function serve(methods: Record<string, (p: Record<string, unknown>) => unk
   return { paths, lines };
 }
 
-test("log lines: <method> failed (<code>[, rule <rule>]): <first line>; asleep errors are bot_asleep with retryAfterSec on the wire", async () => {
+test("log lines: Grok Link's own errors log <method> failed (<code>[, rule <rule>]): <first line>; app and Bot-side errors log the code only", async () => {
   const fileErr = Object.assign(
     new ProtocolError("file_blocked", "Attachment key.pem is a credential file (rule secret_name); Grok Link won't send it.\nsecond line"),
     {
@@ -298,15 +335,17 @@ test("log lines: <method> failed (<code>[, rule <rule>]): <first line>; asleep e
     assert.match(e.message, /\nretryAfterSec: 10$/, "MCP clients see it in the text");
     return true;
   });
-  await assert.rejects(call("routines", {}, paths), { code: "bot_asleep" });
+  // An app error whose text mentions sleep is not bot_asleep: only BotAsleepError is.
+  await assert.rejects(call("routines", {}, paths), { code: "internal" });
   await assert.rejects(call("bots", {}, paths), { code: "internal" });
+  // Grok Link's own errors keep their first line; app and Bot-side errors log the code only.
   assert.deepEqual(lines, [
     "task failed (file_blocked, rule secret_name): Attachment key.pem is a credential file (rule secret_name); Grok Link won't send it.",
     "read failed (bot_asleep): Alpha's computer is asleep. Bring the Grok Bot window to the front, then try again in ~10 s.",
-    "routines failed (bot_asleep): The Bot's computer is asleep. Bring the Grok Bot window to the front, then try again in ~10 s.",
-    "bots failed (internal): boom",
+    "routines failed (internal)",
+    "bots failed (internal)",
   ]);
-  for (const l of lines) assert.ok(!l.includes("secret reply text"));
+  for (const l of lines) assert.ok(!l.includes("secret reply text") && !l.includes("boom"));
 });
 
 test("logLine: first line only, at most 200 characters", () => {

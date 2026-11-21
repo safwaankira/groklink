@@ -62,10 +62,13 @@ function readableTime(when: string | null): string {
 }
 
 /**
- * Run every check, each capped at `timeoutMs` (10 s). `cdp` throws if there's no connection, in which case
+ * Run every check, each capped at `timeoutMs` (10 s). `usage` is the user's warn and pause percents (policy.json). `cdp` throws if there's no connection, in which case
  * `app` fails and the rest are skipped.
  */
-export async function deepProbe(cdp: () => CDP, opts: { timeoutMs?: number } = {}): Promise<ProbeResult> {
+export async function deepProbe(
+  cdp: () => CDP,
+  opts: { timeoutMs?: number; usage?: { warn: number; pause: number } } = {},
+): Promise<ProbeResult> {
   const cap = opts.timeoutMs ?? CHECK_MS;
   const checks: ProbeCheck[] = [];
   const run = async (name: ProbeCheck["name"], fn: () => Promise<Omit<ProbeCheck, "name" | "ms">>) => {
@@ -123,7 +126,13 @@ export async function deepProbe(cdp: () => CDP, opts: { timeoutMs?: number } = {
   await run("usage", async () => {
     const u = await usage(c);
     if (usageOut(u)) return { ok: false, detail: `Grok usage used up, resets ${readableTime(u.resetsAt)}` };
-    return { ok: true, detail: `${Math.floor(u.percentUsed)}% used` };
+    const used = `${Math.floor(u.percentUsed)}% used`;
+    const { warn, pause } = opts.usage ?? { warn: 101, pause: 100 };
+    // The user's own limits: a warning, never a failure.
+    if (pause < 100 && u.percentUsed >= pause)
+      return { ok: true, warn: true, detail: `${used}; new tasks pause at ${pause}% (your setting)` };
+    if (u.percentUsed >= warn) return { ok: true, warn: true, detail: `${used} (warn at ${warn}%)` };
+    return { ok: true, detail: used };
   });
 
   await run("awake", async () => {
@@ -156,6 +165,8 @@ export function probeWarnings(r: ProbeResult): string[] {
         out.push(`Grok Link can't read Bot conversations (${ch.detail}). This Grok Bot version may have changed.`);
         break;
       case "usage":
+        // At the user's warn or pause percent, the check passes with a warning; health adds its own line for that.
+        if (ch.ok) break;
         out.push(ch.detail.startsWith("Grok usage used up") ? `${ch.detail}.` : `Couldn't read Grok usage (${ch.detail}).`);
         break;
       case "awake":
